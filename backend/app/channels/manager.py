@@ -33,6 +33,11 @@ DEFAULT_RUN_CONTEXT: dict[str, Any] = {
 }
 STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.35
 THREAD_BUSY_MESSAGE = "This conversation is already processing another request. Please wait for it to finish and try again."
+STREAM_STATUS_MIN_INTERVAL_SECONDS = 0.30
+MAX_PROGRESS_EVENTS = 8
+STREAM_ATTEMPT_TIMEOUT_SECONDS = 45.0
+STREAM_MAX_RETRIES = 2
+STREAM_RETRY_BASE_DELAY_SECONDS = 0.6
 
 CHANNEL_CAPABILITIES = {
     "discord": {"supports_streaming": False},
@@ -123,6 +128,22 @@ def _merge_dicts(*layers: Any) -> dict[str, Any]:
         if isinstance(layer, Mapping):
             merged.update(layer)
     return merged
+
+
+def _safe_int(raw: Any, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _safe_float(raw: Any, default: float, *, minimum: float, maximum: float) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
 
 
 def _normalize_custom_agent_name(raw_value: str) -> str:
@@ -243,6 +264,108 @@ def _extract_stream_message_id(payload: Any, metadata: Any) -> str | None:
             if isinstance(value, str) and value:
                 return value
     return None
+
+
+def _sanitize_tool_arg_preview(args: Any, *, max_len: int = 120) -> str:
+    if isinstance(args, Mapping):
+        chunks: list[str] = []
+        for key, value in list(args.items())[:3]:
+            value_str = str(value)
+            if len(value_str) > 40:
+                value_str = value_str[:37] + "..."
+            chunks.append(f"{key}={value_str}")
+        preview = ", ".join(chunks)
+    else:
+        preview = str(args)
+    return preview[:max_len]
+
+
+def _stage_for_tool_name(tool_name: str) -> str:
+    lowered = tool_name.lower()
+    chart_or_table_keywords = (
+        "chart",
+        "plot",
+        "graph",
+        "table",
+        "visual",
+        "echarts",
+        "图",
+        "表",
+    )
+    if any(keyword in lowered for keyword in chart_or_table_keywords):
+        return "生成图表/表格"
+    return "调用工具中"
+
+
+def _extract_tool_progress_from_payload(payload: Any) -> list[dict[str, str]]:
+    if not isinstance(payload, Mapping):
+        return []
+
+    events: list[dict[str, str]] = []
+    tool_calls = payload.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, Mapping):
+                continue
+            tool_name = str(tool_call.get("name") or "tool")
+            args_preview = _sanitize_tool_arg_preview(tool_call.get("args", {}))
+            detail = f"{tool_name}({args_preview})" if args_preview else tool_name
+            events.append({"stage": _stage_for_tool_name(tool_name), "detail": detail})
+    return events
+
+
+def _extract_tool_result_events_from_payload(payload: Any) -> list[dict[str, str]]:
+    if not isinstance(payload, Mapping):
+        return []
+
+    payload_type = str(payload.get("type", "")).lower()
+    if "tool" not in payload_type:
+        return []
+
+    tool_name = str(payload.get("name") or payload.get("tool_name") or "tool")
+    status = str(payload.get("status") or "").lower()
+    is_error = bool(payload.get("is_error")) or status in {"error", "failed", "failure"}
+
+    content_value = payload.get("content")
+    content_text = _extract_text_content(content_value)
+    if not content_text and content_value is not None:
+        content_text = str(content_value)
+    preview = _sanitize_tool_arg_preview(content_text, max_len=80) if content_text else ""
+
+    stage = "工具失败" if is_error else "工具完成"
+    detail = f"{tool_name} -> {'失败' if is_error else '完成'}"
+    if preview:
+        detail = f"{detail} ({preview})"
+    return [{"stage": stage, "detail": detail}]
+
+
+def _derive_stage_from_event(event: str, payload: Any, latest_text: str, previous_stage: str) -> str:
+    if event == "messages-tuple":
+        tool_events = _extract_tool_progress_from_payload(payload)
+        if tool_events:
+            return tool_events[-1]["stage"]
+        if latest_text:
+            return "整理答案"
+        if previous_stage in {"检索/读取资料", "解析需求", "调用工具中", "生成图表/表格", "工具完成", "工具失败"}:
+            return previous_stage
+        return "解析需求"
+    if event == "values":
+        if latest_text:
+            return "整理答案"
+        return "检索/读取资料"
+    if event == "error":
+        return "异常处理中"
+    return "处理中"
+
+
+def _is_retryable_stream_error(exc: BaseException) -> bool:
+    if _is_thread_busy_error(exc):
+        return False
+    if isinstance(exc, asyncio.CancelledError):
+        return False
+    if isinstance(exc, (asyncio.TimeoutError, httpx.HTTPError, OSError, ConnectionError, RuntimeError)):
+        return True
+    return False
 
 
 def _accumulate_stream_text(
@@ -522,6 +645,7 @@ class ChannelManager:
         assistant_id: str = DEFAULT_ASSISTANT_ID,
         default_session: dict[str, Any] | None = None,
         channel_sessions: dict[str, Any] | None = None,
+        streaming_config: dict[str, Any] | None = None,
     ) -> None:
         self.bus = bus
         self.store = store
@@ -531,6 +655,31 @@ class ChannelManager:
         self._assistant_id = assistant_id
         self._default_session = _as_dict(default_session)
         self._channel_sessions = dict(channel_sessions or {})
+        streaming = _as_dict(streaming_config)
+        self._stream_attempt_timeout_seconds = _safe_float(
+            streaming.get("attempt_timeout_seconds"),
+            STREAM_ATTEMPT_TIMEOUT_SECONDS,
+            minimum=5.0,
+            maximum=600.0,
+        )
+        self._stream_max_retries = _safe_int(
+            streaming.get("max_retries"),
+            STREAM_MAX_RETRIES,
+            minimum=0,
+            maximum=8,
+        )
+        self._stream_retry_base_delay_seconds = _safe_float(
+            streaming.get("retry_base_delay_seconds"),
+            STREAM_RETRY_BASE_DELAY_SECONDS,
+            minimum=0.0,
+            maximum=10.0,
+        )
+        logger.info(
+            "[Manager] streaming config loaded: attempt_timeout_seconds=%.2f, max_retries=%d, retry_base_delay_seconds=%.2f",
+            self._stream_attempt_timeout_seconds,
+            self._stream_max_retries,
+            self._stream_retry_base_delay_seconds,
+        )
         self._client = None  # lazy init — langgraph_sdk async client
         self._semaphore: asyncio.Semaphore | None = None
         self._running = False
@@ -776,14 +925,48 @@ class ChannelManager:
         logger.info("[Manager] invoking runs.stream(thread_id=%s, text=%r)", thread_id, msg.text[:100])
 
         last_values: dict[str, Any] | list | None = None
-        streamed_buffers: dict[str, str] = {}
-        current_message_id: str | None = None
         latest_text = ""
         last_published_text = ""
         last_publish_at = 0.0
         stream_error: BaseException | None = None
+        progress_events: list[dict[str, str]] = []
+        last_status_publish_at = 0.0
+        current_stage = "已接收请求"
 
-        try:
+        async def publish_progress(stage: str, detail: str | None, *, force: bool = False) -> None:
+            nonlocal last_status_publish_at, progress_events, current_stage
+            now = time.monotonic()
+            if not force and now - last_status_publish_at < STREAM_STATUS_MIN_INTERVAL_SECONDS:
+                return
+            current_stage = stage
+            if detail:
+                event_item = {"stage": stage, "detail": detail}
+                if not progress_events or progress_events[-1] != event_item:
+                    progress_events.append(event_item)
+                    progress_events = progress_events[-MAX_PROGRESS_EVENTS:]
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel_name=msg.channel_name,
+                    chat_id=msg.chat_id,
+                    thread_id=thread_id,
+                    text=latest_text or "正在处理中...",
+                    is_final=False,
+                    thread_ts=msg.thread_ts,
+                    metadata={
+                        "status_stage": stage,
+                        "progress_events": list(progress_events),
+                    },
+                )
+            )
+            last_status_publish_at = now
+
+        await publish_progress("已接收请求", "消息已接收，准备执行", force=True)
+        await publish_progress("解析需求", "正在分析输入并规划步骤", force=True)
+
+        async def run_single_stream_attempt() -> None:
+            nonlocal last_values, latest_text, last_published_text, last_publish_at, current_stage
+            streamed_buffers: dict[str, str] = {}
+            current_message_id: str | None = None
             async for chunk in client.runs.stream(
                 thread_id,
                 assistant_id,
@@ -800,6 +983,15 @@ class ChannelManager:
                     accumulated_text, current_message_id = _accumulate_stream_text(streamed_buffers, current_message_id, data)
                     if accumulated_text:
                         latest_text = accumulated_text
+                        if current_stage not in {"整理答案", "发送结果"}:
+                            await publish_progress("整理答案", "收到模型输出片段", force=True)
+                    payload = data[0] if isinstance(data, (list, tuple)) and data else data
+                    tool_events = _extract_tool_progress_from_payload(payload)
+                    for tool_event in tool_events:
+                        await publish_progress(tool_event["stage"], tool_event["detail"], force=True)
+                    tool_result_events = _extract_tool_result_events_from_payload(payload)
+                    for tool_event in tool_result_events:
+                        await publish_progress(tool_event["stage"], tool_event["detail"], force=True)
                 elif event == "values" and isinstance(data, (dict, list)):
                     last_values = data
                     snapshot_text = _extract_response_text(data)
@@ -807,6 +999,13 @@ class ChannelManager:
                         latest_text = snapshot_text
 
                 if not latest_text or latest_text == last_published_text:
+                    stage = _derive_stage_from_event(
+                        event,
+                        data[0] if isinstance(data, (list, tuple)) and data else data,
+                        latest_text,
+                        current_stage,
+                    )
+                    await publish_progress(stage, None)
                     continue
 
                 now = time.monotonic()
@@ -821,16 +1020,42 @@ class ChannelManager:
                         text=latest_text,
                         is_final=False,
                         thread_ts=msg.thread_ts,
+                        metadata={
+                            "status_stage": "整理答案",
+                            "progress_events": list(progress_events),
+                        },
                     )
                 )
                 last_published_text = latest_text
                 last_publish_at = now
-        except Exception as exc:
-            stream_error = exc
-            if _is_thread_busy_error(exc):
-                logger.warning("[Manager] thread busy (concurrent run rejected): thread_id=%s", thread_id)
-            else:
-                logger.exception("[Manager] streaming error: thread_id=%s", thread_id)
+
+        try:
+            max_attempts = self._stream_max_retries + 1
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    await asyncio.wait_for(run_single_stream_attempt(), timeout=self._stream_attempt_timeout_seconds)
+                    stream_error = None
+                    break
+                except Exception as exc:
+                    stream_error = exc
+                    if _is_thread_busy_error(exc):
+                        logger.warning("[Manager] thread busy (concurrent run rejected): thread_id=%s", thread_id)
+                    else:
+                        logger.exception(
+                            "[Manager] streaming error: thread_id=%s attempt=%d/%d",
+                            thread_id,
+                            attempt,
+                            max_attempts,
+                        )
+                    error_label = "流式超时" if isinstance(exc, asyncio.TimeoutError) else exc.__class__.__name__
+                    await publish_progress("异常处理中", f"第{attempt}次失败: {error_label}", force=True)
+                    if attempt < max_attempts and _is_retryable_stream_error(exc):
+                        delay = min(self._stream_retry_base_delay_seconds * attempt, 2.0)
+                        await publish_progress("重试中", f"第{attempt + 1}次重试，{delay:.1f}s 后继续", force=True)
+                        await asyncio.sleep(delay)
+                        await publish_progress("检索/读取资料", f"已发起第{attempt + 1}次尝试", force=True)
+                        continue
+                    break
         finally:
             result = last_values if last_values is not None else {"messages": [{"type": "ai", "content": latest_text}]}
             response_text = _extract_response_text(result)
@@ -855,6 +1080,7 @@ class ChannelManager:
                 len(artifacts),
                 stream_error,
             )
+            await publish_progress("发送结果", "正在发送最终结果", force=True)
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel_name=msg.channel_name,
@@ -865,6 +1091,10 @@ class ChannelManager:
                     attachments=attachments,
                     is_final=True,
                     thread_ts=msg.thread_ts,
+                    metadata={
+                        "status_stage": "发送结果",
+                        "progress_events": list(progress_events),
+                    },
                 )
             )
 

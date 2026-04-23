@@ -796,12 +796,41 @@ checkpointer:
 #       is_plan_mode: false
 #       subagent_enabled: false
 #
+#   # Optional: streaming reliability knobs for channel manager.
+#   # These settings only affect streaming behavior; they do NOT enable any IM channel by themselves.
+#   # Per-attempt timeout (seconds) for runs.stream.
+#   # Timeout enters "异常处理中", then retries on retryable errors.
+#   # Range clamped to [5, 600].
+#   streaming:
+#     attempt_timeout_seconds: 45
+#     # Number of retries after the first attempt.
+#     # Example: 2 means up to 1 initial attempt + 2 retries = 3 total attempts.
+#     # Range clamped to [0, 8].
+#     max_retries: 2
+#     # Base backoff delay (seconds) before retries.
+#     # Effective delay = min(retry_base_delay_seconds * failure_index, 2.0).
+#     # Range clamped to [0, 10].
+#     retry_base_delay_seconds: 0.6
+#
 #   feishu:
 #     enabled: false
 #     app_id: $FEISHU_APP_ID
 #     app_secret: $FEISHU_APP_SECRET
 #     # domain: https://open.feishu.cn       # China (default)
 #     # domain: https://open.larksuite.com   # International
+#     # Context isolation strategy for mapping Feishu messages to DeerFlow threads.
+#     # chat/group: one thread per chat_id, topic: one thread per topic(root_id/message_id)
+#     context_boundary: chat
+#     # Whether to reply inside Feishu thread/topic.
+#     # false: reply in normal chat stream, true: reply in thread
+#     reply_in_thread: false
+#     # Card render style baseline for Feishu replies (phase-2 uses this switch).
+#     card_style: rich
+#     # Reply render mode:
+#     # auto: card for visual/table/chart-like outputs, text for plain responses
+#     # card: always use interactive card
+#     # text: always use plain text message
+#     render_mode: auto
 #
 #   slack:
 #     enabled: false

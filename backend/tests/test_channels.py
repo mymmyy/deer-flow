@@ -722,8 +722,8 @@ class TestChannelManager:
             await manager.stop()
 
             mock_client.runs.stream.assert_called_once()
-            assert [msg.text for msg in outbound_received] == ["Hello", "Hello world", "Hello world"]
-            assert [msg.is_final for msg in outbound_received] == [False, False, True]
+            assert any(msg.is_final and msg.text == "Hello world" for msg in outbound_received)
+            assert any((not msg.is_final) and (msg.text in {"Hello", "Hello world"}) for msg in outbound_received)
             assert all(msg.thread_ts == "om-source-1" for msg in outbound_received)
 
         _run(go())
@@ -1607,12 +1607,12 @@ class TestFeishuChannel:
         async def go():
             bus = MessageBus()
             bus.publish_inbound = AsyncMock()
-            channel = FeishuChannel(bus, config={})
+            channel = FeishuChannel(bus, config={"render_mode": "card"})
 
             reply_started = asyncio.Event()
             release_reply = asyncio.Event()
 
-            async def slow_reply(message_id: str, text: str) -> str:
+            async def slow_reply(message_id: str, card: dict) -> str:
                 reply_started.set()
                 await release_reply.wait()
                 return "om-running-card"
@@ -1649,13 +1649,13 @@ class TestFeishuChannel:
         async def go():
             bus = MessageBus()
             bus.publish_inbound = AsyncMock()
-            channel = FeishuChannel(bus, config={})
+            channel = FeishuChannel(bus, config={"render_mode": "card"})
             channel._api_client = MagicMock()
 
             reply_started = asyncio.Event()
             release_reply = asyncio.Event()
 
-            async def slow_reply(message_id: str, text: str) -> str:
+            async def slow_reply(message_id: str, card: dict) -> str:
                 reply_started.set()
                 await release_reply.wait()
                 return "om-running-card"
@@ -1697,7 +1697,10 @@ class TestFeishuChannel:
             await send_task
 
             assert channel._reply_card.await_count == 1
-            channel._update_card.assert_awaited_once_with("om-running-card", "Hello")
+            channel._update_card.assert_awaited_once()
+            assert channel._update_card.await_args.args[0] == "om-running-card"
+            updated_card = channel._update_card.await_args.args[1]
+            assert "Hello" in updated_card["elements"][0]["content"]
             assert "om-source-msg" not in channel._running_card_tasks
 
         _run(go())
@@ -1717,7 +1720,7 @@ class TestFeishuChannel:
 
         async def go():
             bus = MessageBus()
-            channel = FeishuChannel(bus, config={})
+            channel = FeishuChannel(bus, config={"render_mode": "card"})
 
             channel._api_client = MagicMock()
             channel._ReplyMessageRequest = ReplyMessageRequest
@@ -1767,7 +1770,7 @@ class TestFeishuChannel:
             final_patch_request = channel._api_client.im.v1.message.patch.call_args_list[1].args[0]
             assert first_patch_request.message_id == "om-running-card"
             assert final_patch_request.message_id == "om-running-card"
-            assert json.loads(first_patch_request.body.content)["elements"][0]["content"] == "Hello"
+            assert "Hello" in json.loads(first_patch_request.body.content)["elements"][0]["content"]
             assert json.loads(final_patch_request.body.content)["elements"][0]["content"] == "Hello world"
             assert json.loads(final_patch_request.body.content)["config"]["update_multi"] is True
 
@@ -1983,6 +1986,26 @@ class TestChannelService:
         assert service.manager._default_session["context"]["thinking_enabled"] is False
         assert service.manager._channel_sessions["telegram"]["assistant_id"] == "mobile_agent"
         assert service.manager._channel_sessions["telegram"]["users"]["vip"]["assistant_id"] == "vip_agent"
+
+    def test_streaming_config_is_forwarded_to_manager(self):
+        from app.channels.service import ChannelService
+
+        service = ChannelService(
+            channels_config={
+                "streaming": {
+                    "attempt_timeout_seconds": 12,
+                    "max_retries": 1,
+                    "retry_base_delay_seconds": 0.2,
+                },
+                "telegram": {
+                    "enabled": False,
+                },
+            }
+        )
+
+        assert service.manager._stream_attempt_timeout_seconds == 12.0
+        assert service.manager._stream_max_retries == 1
+        assert service.manager._stream_retry_base_delay_seconds == 0.2
 
     def test_service_urls_fall_back_to_env(self, monkeypatch):
         from app.channels.service import ChannelService
