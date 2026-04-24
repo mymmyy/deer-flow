@@ -15,6 +15,7 @@ from app.gateway.routers import (
     memory,
     models,
     runs,
+    runs_shortcuts,
     skills,
     suggestions,
     thread_runs,
@@ -204,6 +205,8 @@ This gateway provides custom endpoints for models, MCP configuration, skills, an
 
     # Stateless Runs API (stream/wait without a pre-existing thread)
     app.include_router(runs.router)
+    # GET shortcut runs API for fixed model/mode button calls
+    app.include_router(runs_shortcuts.router)
 
     @app.get("/health", tags=["health"])
     async def health_check() -> dict:

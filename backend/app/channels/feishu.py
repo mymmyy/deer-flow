@@ -498,12 +498,25 @@ class FeishuChannel(Channel):
             columns = table.get("columns")
             rows = table.get("rows")
             if isinstance(columns, list) and isinstance(rows, list):
-                markdown_table = self._build_markdown_table(
-                    [str(col) for col in columns],
-                    [row if isinstance(row, list) else [row] for row in rows],
-                )
+                normalized_columns = [str(col) for col in columns]
+                normalized_rows = [
+                    [str(cell) for cell in (row if isinstance(row, list) else [row])] for row in rows
+                ]
+                markdown_table = self._build_markdown_table(normalized_columns, normalized_rows)
                 if markdown_table:
-                    elements.append({"tag": "markdown", "content": markdown_table})
+                    # Reuse auto table->chart conversion so payload.table can render as
+                    # native card chart elements instead of raw markdown text.
+                    auto_table_card = self._build_card_from_markdown_table(markdown_table)
+                    if isinstance(auto_table_card, dict):
+                        auto_elements = auto_table_card.get("elements")
+                        if isinstance(auto_elements, list):
+                            for element in auto_elements:
+                                if not isinstance(element, dict):
+                                    continue
+                                # Avoid leaking raw markdown table in card mode.
+                                if element.get("tag") == "markdown" and "|" in str(element.get("content", "")):
+                                    continue
+                                elements.append(element)
 
         chart_spec = self._normalize_legacy_chart_payload(payload)
         if isinstance(chart_spec, dict):
@@ -751,19 +764,29 @@ class FeishuChannel(Channel):
 
         logger.error("[Feishu] send failed after %d attempts: %s", _max_retries, last_exc)
         if mode == "card" and msg.is_final:
-            logger.warning(
-                "[Feishu] card delivery failed after retries, fallback to text reply: chat_id=%s source=%s",
-                msg.chat_id,
-                msg.thread_ts,
-            )
-            try:
-                await self._send_text_message(msg)
-                if msg.thread_ts:
-                    self._message_render_modes.pop(msg.thread_ts, None)
-                return
-            except Exception as fallback_exc:
-                logger.exception("[Feishu] text fallback also failed for source=%s", msg.thread_ts)
-                last_exc = fallback_exc
+            has_existing_card = bool(msg.thread_ts and self._running_card_ids.get(msg.thread_ts))
+            if has_existing_card:
+                # A card already exists for this source message; avoid sending a
+                # second text reply that creates duplicate final outputs.
+                logger.warning(
+                    "[Feishu] card delivery failed after retries and an existing card is present; skip text fallback to avoid duplicate replies: chat_id=%s source=%s",
+                    msg.chat_id,
+                    msg.thread_ts,
+                )
+            else:
+                logger.warning(
+                    "[Feishu] card delivery failed after retries, fallback to text reply: chat_id=%s source=%s",
+                    msg.chat_id,
+                    msg.thread_ts,
+                )
+                try:
+                    await self._send_text_message(msg)
+                    if msg.thread_ts:
+                        self._message_render_modes.pop(msg.thread_ts, None)
+                    return
+                except Exception as fallback_exc:
+                    logger.exception("[Feishu] text fallback also failed for source=%s", msg.thread_ts)
+                    last_exc = fallback_exc
         if msg.is_final and msg.thread_ts:
             self._message_render_modes.pop(msg.thread_ts, None)
         if last_exc is None:
@@ -1330,5 +1353,4 @@ class FeishuChannel(Channel):
                 logger.warning("[Feishu] main loop not running, cannot publish inbound message")
         except Exception:
             logger.exception("[Feishu] error processing message")
-
 
