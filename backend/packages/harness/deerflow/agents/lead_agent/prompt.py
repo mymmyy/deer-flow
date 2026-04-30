@@ -403,6 +403,8 @@ You: "Deploying to staging..." [proceed]
 
 {skills_section}
 
+{feishu_channel_section}
+
 {deferred_tools_section}
 
 {subagent_section}
@@ -674,7 +676,30 @@ def _build_custom_mounts_section() -> str:
     return f"\n**Custom Mounted Directories:**\n{mounts_list}\n- If the user needs files outside `/mnt/user-data`, use these absolute container paths directly when they match the requested directory"
 
 
-def apply_prompt_template(subagent_enabled: bool = False, max_concurrent_subagents: int = 3, *, agent_name: str | None = None, available_skills: set[str] | None = None) -> str:
+def _build_feishu_channel_section(channel_name: str | None) -> str:
+    if (channel_name or "").strip().lower() != "feishu":
+        return ""
+    return """<feishu_channel_contract>
+You are serving requests from Feishu channel.
+
+Feishu chart output rules (STRICT):
+- For chart/table visualization requests, do NOT use bash/node/python scripts.
+- Do NOT ask users for permission to execute local scripts.
+- Return structured Feishu metadata only:
+  1) Preferred: `metadata.feishu_skill_contract` (card_schema_version=v1, target_channel=feishu)
+  2) Compatible: `metadata.feishu_card_payload.chart_spec`
+- If chart contract cannot be produced, provide clear text fallback instead of tool/script escalation.
+</feishu_channel_contract>"""
+
+
+def apply_prompt_template(
+    subagent_enabled: bool = False,
+    max_concurrent_subagents: int = 3,
+    *,
+    agent_name: str | None = None,
+    available_skills: set[str] | None = None,
+    channel_name: str | None = None,
+) -> str:
     # Get memory context
     memory_context = _get_memory_context(agent_name)
 
@@ -710,12 +735,14 @@ def apply_prompt_template(subagent_enabled: bool = False, max_concurrent_subagen
     acp_section = _build_acp_section()
     custom_mounts_section = _build_custom_mounts_section()
     acp_and_mounts_section = "\n".join(section for section in (acp_section, custom_mounts_section) if section)
+    feishu_channel_section = _build_feishu_channel_section(channel_name)
 
     # Format the prompt with dynamic skills and memory
     prompt = SYSTEM_PROMPT_TEMPLATE.format(
         agent_name=agent_name or "DeerFlow 2.0",
         soul=get_agent_soul(agent_name),
         skills_section=skills_section,
+        feishu_channel_section=feishu_channel_section,
         deferred_tools_section=deferred_tools_section,
         memory_context=memory_context,
         subagent_section=subagent_section,

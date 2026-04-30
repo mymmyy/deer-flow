@@ -291,6 +291,7 @@ def make_lead_agent(config: RunnableConfig):
     subagent_enabled = cfg.get("subagent_enabled", False)
     max_concurrent_subagents = cfg.get("max_concurrent_subagents", 3)
     is_bootstrap = cfg.get("is_bootstrap", False)
+    channel_name = cfg.get("channel_name")
     agent_name = validate_agent_name(cfg.get("agent_name"))
 
     agent_config = load_agent_config(agent_name) if not is_bootstrap else None
@@ -342,9 +343,19 @@ def make_lead_agent(config: RunnableConfig):
             model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled),
             tools=get_available_tools(model_name=model_name, subagent_enabled=subagent_enabled) + [setup_agent],
             middleware=_build_middlewares(config, model_name=model_name),
-            system_prompt=apply_prompt_template(subagent_enabled=subagent_enabled, max_concurrent_subagents=max_concurrent_subagents, available_skills=set(["bootstrap"])),
+            system_prompt=apply_prompt_template(
+                subagent_enabled=subagent_enabled,
+                max_concurrent_subagents=max_concurrent_subagents,
+                available_skills=set(["bootstrap"]),
+                channel_name=channel_name,
+            ),
             state_schema=ThreadState,
         )
+
+    selected_skills = set(agent_config.skills) if agent_config and agent_config.skills is not None else None
+    if (channel_name or "").strip().lower() == "feishu":
+        selected_skills = set(selected_skills or set())
+        selected_skills.add("feishu-chart-contract")
 
     # Default lead agent (unchanged behavior)
     return create_agent(
@@ -352,7 +363,11 @@ def make_lead_agent(config: RunnableConfig):
         tools=get_available_tools(model_name=model_name, groups=agent_config.tool_groups if agent_config else None, subagent_enabled=subagent_enabled),
         middleware=_build_middlewares(config, model_name=model_name, agent_name=agent_name),
         system_prompt=apply_prompt_template(
-            subagent_enabled=subagent_enabled, max_concurrent_subagents=max_concurrent_subagents, agent_name=agent_name, available_skills=set(agent_config.skills) if agent_config and agent_config.skills is not None else None
+            subagent_enabled=subagent_enabled,
+            max_concurrent_subagents=max_concurrent_subagents,
+            agent_name=agent_name,
+            available_skills=selected_skills,
+            channel_name=channel_name,
         ),
         state_schema=ThreadState,
     )

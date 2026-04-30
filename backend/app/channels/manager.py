@@ -1,8 +1,9 @@
-"""ChannelManager — consumes inbound messages and dispatches them to the DeerFlow agent via LangGraph Server."""
+"""ChannelManager consumes inbound messages and dispatches them to the DeerFlow agent via LangGraph Server."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import re
@@ -34,7 +35,10 @@ DEFAULT_RUN_CONTEXT: dict[str, Any] = {
 STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.35
 THREAD_BUSY_MESSAGE = "This conversation is already processing another request. Please wait for it to finish and try again."
 STREAM_STATUS_MIN_INTERVAL_SECONDS = 0.30
-MAX_PROGRESS_EVENTS = 8
+STREAM_HEARTBEAT_INTERVAL_SECONDS = 2.0
+STREAM_HEARTBEAT_DETAIL = "持续处理中"
+MAX_PROGRESS_EVENTS = 50
+MAX_PROGRESS_TIMELINE_EVENTS = 200
 STREAM_ATTEMPT_TIMEOUT_SECONDS = 45.0
 STREAM_MAX_RETRIES = 2
 STREAM_RETRY_BASE_DELAY_SECONDS = 0.6
@@ -118,6 +122,31 @@ def _is_thread_busy_error(exc: BaseException | None) -> bool:
     return "already running a task" in str(exc)
 
 
+def _extract_error_status_code(exc: BaseException | None) -> int | None:
+    if exc is None:
+        return None
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def _is_thread_or_assistant_not_found_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    text = str(exc).lower()
+    not_found_hint = (
+        "thread or assistant not found" in text
+        or "thread not found" in text
+        or "assistant not found" in text
+    )
+    if not not_found_hint:
+        return False
+    status_code = _extract_error_status_code(exc)
+    return status_code == 404 or status_code is None
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
@@ -144,6 +173,107 @@ def _safe_float(raw: Any, default: float, *, minimum: float, maximum: float) -> 
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, value))
+
+
+_ALLOWED_REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
+_DEFAULT_MODEL_NAME_CACHE: str | None = None
+
+
+def _normalize_session_overrides(overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """Filter/normalize user session overrides before persistence."""
+    normalized: dict[str, Any] = {}
+
+    model_name = overrides.get("model_name")
+    if isinstance(model_name, str) and model_name.strip():
+        normalized["model_name"] = model_name.strip()
+
+    plan_mode = overrides.get("is_plan_mode")
+    if isinstance(plan_mode, bool):
+        normalized["is_plan_mode"] = plan_mode
+
+    subagent_enabled = overrides.get("subagent_enabled")
+    if isinstance(subagent_enabled, bool):
+        normalized["subagent_enabled"] = subagent_enabled
+
+    reasoning_effort = overrides.get("reasoning_effort")
+    if isinstance(reasoning_effort, str):
+        effort = reasoning_effort.strip().lower()
+        if effort in _ALLOWED_REASONING_EFFORTS:
+            normalized["reasoning_effort"] = effort
+
+    return normalized
+
+
+def _format_session_summary(session: Mapping[str, Any]) -> str:
+    model_name = session.get("model_name")
+    is_plan_mode = session.get("is_plan_mode")
+    subagent_enabled = session.get("subagent_enabled")
+    reasoning_effort = session.get("reasoning_effort")
+    lines = [
+        "Session overrides:",
+        f"- model_name: {model_name if isinstance(model_name, str) and model_name else '(default)'}",
+        f"- is_plan_mode: {is_plan_mode if isinstance(is_plan_mode, bool) else '(default)'}",
+        f"- subagent_enabled: {subagent_enabled if isinstance(subagent_enabled, bool) else '(default)'}",
+        f"- reasoning_effort: {reasoning_effort if isinstance(reasoning_effort, str) and reasoning_effort else '(default)'}",
+    ]
+    return "\n".join(lines)
+
+
+def _resolve_mode_label_from_context(context: Mapping[str, Any]) -> str:
+    plan = bool(context.get("is_plan_mode"))
+    subagent = bool(context.get("subagent_enabled"))
+    reasoning = str(context.get("reasoning_effort") or "").strip().lower()
+
+    if (not plan) and (not subagent) and reasoning == "minimal":
+        return "Flash"
+    if (not plan) and (not subagent) and reasoning == "low":
+        return "Thinking"
+    if plan and (not subagent) and reasoning == "medium":
+        return "Pro"
+    if plan and subagent and reasoning == "high":
+        return "Ultra"
+    return "Custom"
+
+
+def _resolve_default_model_name() -> str:
+    global _DEFAULT_MODEL_NAME_CACHE
+    if isinstance(_DEFAULT_MODEL_NAME_CACHE, str) and _DEFAULT_MODEL_NAME_CACHE:
+        return _DEFAULT_MODEL_NAME_CACHE
+    try:
+        from deerflow.config import get_app_config
+
+        cfg = get_app_config()
+        models = getattr(cfg, "models", None)
+        if isinstance(models, list) and models:
+            first = models[0]
+            name = getattr(first, "name", None)
+            if isinstance(name, str) and name.strip():
+                _DEFAULT_MODEL_NAME_CACHE = name.strip()
+                return _DEFAULT_MODEL_NAME_CACHE
+    except Exception:
+        logger.debug("[Manager] failed to resolve default model name from config", exc_info=True)
+    _DEFAULT_MODEL_NAME_CACHE = "default"
+    return _DEFAULT_MODEL_NAME_CACHE
+
+
+def _build_runtime_footer_from_context(context: Mapping[str, Any], *, channel_name: str | None = None) -> str:
+    model_name = str(context.get("model_name") or "").strip() or _resolve_default_model_name()
+    mode_label = _resolve_mode_label_from_context(context)
+    footer = f"[模型：{model_name}][模式：{mode_label}]"
+    if str(channel_name or "").strip().lower() == "feishu":
+        return f"<font color='grey'>{footer}</font>"
+    return footer
+
+
+def _append_runtime_footer(text: str, context: Mapping[str, Any], *, channel_name: str | None = None) -> str:
+    body = str(text or "").rstrip()
+    if str(channel_name or "").strip().lower() != "feishu":
+        return body
+    plain_footer = f"[模型：{str(context.get('model_name') or '').strip() or _resolve_default_model_name()}][模式：{_resolve_mode_label_from_context(context)}]"
+    footer = _build_runtime_footer_from_context(context, channel_name=channel_name)
+    if body.endswith(footer) or body.endswith(plain_footer):
+        return body
+    return f"{body}\n\n{footer}" if body else footer
 
 
 def _normalize_custom_agent_name(raw_value: str) -> str:
@@ -182,7 +312,7 @@ def _extract_response_text(result: dict | list) -> str:
 
         msg_type = msg.get("type")
 
-        # Stop at the last human message — anything before it is a previous turn
+        # Stop at the last human message; anything before it is a previous turn
         if msg_type == "human":
             break
 
@@ -289,8 +419,8 @@ def _stage_for_tool_name(tool_name: str) -> str:
         "table",
         "visual",
         "echarts",
-        "图",
-        "表",
+        "figure",
+        "sheet",
     )
     if any(keyword in lowered for keyword in chart_or_table_keywords):
         return "生成图表/表格"
@@ -333,7 +463,7 @@ def _extract_tool_result_events_from_payload(payload: Any) -> list[dict[str, str
     preview = _sanitize_tool_arg_preview(content_text, max_len=80) if content_text else ""
 
     stage = "工具失败" if is_error else "工具完成"
-    detail = f"{tool_name} -> {'失败' if is_error else '完成'}"
+    detail = f"{tool_name} -> {'failed' if is_error else 'finished'}"
     if preview:
         detail = f"{detail} ({preview})"
     return [{"stage": stage, "detail": detail}]
@@ -346,7 +476,14 @@ def _derive_stage_from_event(event: str, payload: Any, latest_text: str, previou
             return tool_events[-1]["stage"]
         if latest_text:
             return "整理答案"
-        if previous_stage in {"检索/读取资料", "解析需求", "调用工具中", "生成图表/表格", "工具完成", "工具失败"}:
+        if previous_stage in {
+            "检索/读取资料",
+            "解析需求",
+            "调用工具中",
+            "生成图表/表格",
+            "工具完成",
+            "工具失败",
+        }:
             return previous_stage
         return "解析需求"
     if event == "values":
@@ -357,9 +494,10 @@ def _derive_stage_from_event(event: str, payload: Any, latest_text: str, previou
         return "异常处理中"
     return "处理中"
 
-
 def _is_retryable_stream_error(exc: BaseException) -> bool:
     if _is_thread_busy_error(exc):
+        return False
+    if _is_thread_or_assistant_not_found_error(exc):
         return False
     if isinstance(exc, asyncio.CancelledError):
         return False
@@ -424,7 +562,7 @@ def _extract_artifacts(result: dict | list) -> list[str]:
     for msg in reversed(messages):
         if not isinstance(msg, dict):
             continue
-        # Stop at the last human message — anything before it is a previous turn
+        # Stop at the last human message; anything before it is a previous turn
         if msg.get("type") == "human":
             break
         # Look for AI messages with present_files tool calls
@@ -438,6 +576,233 @@ def _extract_artifacts(result: dict | list) -> list[str]:
     return artifacts
 
 
+def _extract_feishu_skill_contract_from_mapping(data: Mapping[str, Any]) -> dict[str, Any] | None:
+    direct = data.get("feishu_skill_contract")
+    if isinstance(direct, Mapping):
+        return dict(direct)
+
+    for container_key in ("metadata", "kwargs", "additional_kwargs"):
+        container = data.get(container_key)
+        if not isinstance(container, Mapping):
+            continue
+        nested = container.get("feishu_skill_contract")
+        if isinstance(nested, Mapping):
+            return dict(nested)
+        nested_metadata = container.get("metadata")
+        if isinstance(nested_metadata, Mapping):
+            nested_2 = nested_metadata.get("feishu_skill_contract")
+            if isinstance(nested_2, Mapping):
+                return dict(nested_2)
+
+    content = data.get("content")
+    content_text = _extract_text_content(content)
+    if content_text:
+        contract = _extract_feishu_skill_contract_from_text(content_text)
+        if isinstance(contract, dict):
+            return contract
+    return None
+
+
+def _extract_json_mappings_from_text(text: str) -> list[dict[str, Any]]:
+    raw = text.strip()
+    if not raw:
+        return []
+
+    candidates: list[str] = [raw]
+    fence_pattern = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+    for match in fence_pattern.finditer(raw):
+        block = match.group(1).strip()
+        if block:
+            candidates.append(block)
+
+    decoder = json.JSONDecoder()
+    parsed_mappings: list[dict[str, Any]] = []
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, Mapping):
+                parsed_mappings.append(dict(parsed))
+            continue
+        except Exception:
+            pass
+
+        idx = 0
+        length = len(candidate)
+        while idx < length:
+            if candidate[idx] != "{":
+                idx += 1
+                continue
+            try:
+                parsed_obj, end = decoder.raw_decode(candidate[idx:])
+            except Exception:
+                idx += 1
+                continue
+            if isinstance(parsed_obj, Mapping):
+                parsed_mappings.append(dict(parsed_obj))
+            idx += max(end, 1)
+    return parsed_mappings
+
+
+def _extract_feishu_skill_contract_from_parsed_payload(parsed: Mapping[str, Any]) -> dict[str, Any] | None:
+    direct = parsed.get("feishu_skill_contract")
+    if isinstance(direct, Mapping):
+        return dict(direct)
+
+    metadata = parsed.get("metadata")
+    if isinstance(metadata, Mapping):
+        nested = metadata.get("feishu_skill_contract")
+        if isinstance(nested, Mapping):
+            return dict(nested)
+    return None
+
+
+def _extract_feishu_card_payload_from_parsed_payload(parsed: Mapping[str, Any]) -> dict[str, Any] | None:
+    direct = parsed.get("feishu_card_payload")
+    if isinstance(direct, Mapping):
+        return dict(direct)
+
+    metadata = parsed.get("metadata")
+    if isinstance(metadata, Mapping):
+        nested = metadata.get("feishu_card_payload")
+        if isinstance(nested, Mapping):
+            return dict(nested)
+    return None
+
+
+def _extract_feishu_skill_contract_from_text(text: str) -> dict[str, Any] | None:
+    for parsed in _extract_json_mappings_from_text(text):
+        contract = _extract_feishu_skill_contract_from_parsed_payload(parsed)
+        if isinstance(contract, dict):
+            return contract
+    return None
+
+
+def _extract_feishu_card_payload_from_text(text: str) -> dict[str, Any] | None:
+    for parsed in _extract_json_mappings_from_text(text):
+        payload = _extract_feishu_card_payload_from_parsed_payload(parsed)
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _extract_feishu_card_payload_from_mapping(data: Mapping[str, Any]) -> dict[str, Any] | None:
+    direct = data.get("feishu_card_payload")
+    if isinstance(direct, Mapping):
+        return dict(direct)
+
+    for container_key in ("metadata", "kwargs", "additional_kwargs"):
+        container = data.get(container_key)
+        if not isinstance(container, Mapping):
+            continue
+        nested = container.get("feishu_card_payload")
+        if isinstance(nested, Mapping):
+            return dict(nested)
+        nested_metadata = container.get("metadata")
+        if isinstance(nested_metadata, Mapping):
+            nested_2 = nested_metadata.get("feishu_card_payload")
+            if isinstance(nested_2, Mapping):
+                return dict(nested_2)
+
+    content = data.get("content")
+    content_text = _extract_text_content(content)
+    if content_text:
+        payload = _extract_feishu_card_payload_from_text(content_text)
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _extract_feishu_card_payload(result: dict | list) -> dict[str, Any] | None:
+    if isinstance(result, list):
+        messages = result
+    elif isinstance(result, dict):
+        messages = result.get("messages", [])
+    else:
+        return None
+
+    for msg in reversed(messages):
+        if not isinstance(msg, Mapping):
+            continue
+        if msg.get("type") == "human":
+            break
+        if msg.get("type") != "ai":
+            continue
+        payload = _extract_feishu_card_payload_from_mapping(msg)
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _extract_feishu_skill_contract(result: dict | list) -> dict[str, Any] | None:
+    """Extract feishu_skill_contract from the latest AI turn metadata."""
+    if isinstance(result, list):
+        messages = result
+    elif isinstance(result, dict):
+        messages = result.get("messages", [])
+    else:
+        return None
+
+    for msg in reversed(messages):
+        if not isinstance(msg, Mapping):
+            continue
+        if msg.get("type") == "human":
+            break
+        if msg.get("type") != "ai":
+            continue
+        contract = _extract_feishu_skill_contract_from_mapping(msg)
+        if isinstance(contract, dict):
+            return contract
+    return None
+
+
+def _extract_feishu_skill_contract_from_stream_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, Mapping):
+        return None
+    return _extract_feishu_skill_contract_from_mapping(payload)
+
+
+def _extract_feishu_card_payload_from_stream_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, Mapping):
+        return None
+    return _extract_feishu_card_payload_from_mapping(payload)
+
+
+def _feishu_payload_source_label(
+    *,
+    has_contract: bool,
+    has_card_payload: bool,
+    chart_requested: bool,
+) -> str:
+    if has_contract:
+        return "skill_contract"
+    if has_card_payload:
+        return "card_payload"
+    if chart_requested:
+        return "missing_for_chart_intent"
+    return "none"
+
+
+def _looks_like_chart_request(text: str) -> bool:
+    lowered = text.lower()
+    keywords = (
+        "图表",
+        "用图展示",
+        "图展示",
+        "可视化",
+        "趋势图",
+        "折线图",
+        "柱状图",
+        "饼图",
+        "走势图",
+        "chart",
+        "graph",
+        "plot",
+        "trend",
+        "visualize",
+    )
+    return any(word in lowered for word in keywords)
+
+
 def _format_artifact_text(artifacts: list[str]) -> str:
     """Format artifact paths into a human-readable text block listing filenames."""
     import posixpath
@@ -449,6 +814,10 @@ def _format_artifact_text(artifacts: list[str]) -> str:
 
 
 _OUTPUTS_VIRTUAL_PREFIX = "/mnt/user-data/outputs/"
+_FEISHU_CHART_CONTRACT_REQUIRED_TEXT = (
+    "该请求包含可视化需求。飞书渠道仅支持通过卡片图表返回可视化结果。"
+    "请重试并返回 `feishu_skill_contract` 或 `feishu_card_payload.chart_spec`。"
+)
 
 
 def _resolve_attachments(thread_id: str, artifacts: list[str]) -> list[ResolvedAttachment]:
@@ -680,7 +1049,7 @@ class ChannelManager:
             self._stream_max_retries,
             self._stream_retry_base_delay_seconds,
         )
-        self._client = None  # lazy init — langgraph_sdk async client
+        self._client = None  # lazy init for langgraph_sdk async client
         self._semaphore: asyncio.Semaphore | None = None
         self._running = False
         self._task: asyncio.Task | None = None
@@ -695,8 +1064,18 @@ class ChannelManager:
         user_layer = _as_dict(users_layer.get(msg.user_id))
         return channel_layer, user_layer
 
+    def _get_runtime_session_overrides(self, msg: InboundMessage) -> dict[str, Any]:
+        stored = self.store.get_session_overrides(
+            msg.channel_name,
+            msg.chat_id,
+            topic_id=msg.topic_id,
+            user_id=msg.user_id,
+        )
+        return _normalize_session_overrides(stored)
+
     def _resolve_run_params(self, msg: InboundMessage, thread_id: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
         channel_layer, user_layer = self._resolve_session_layer(msg)
+        runtime_overrides = self._get_runtime_session_overrides(msg)
 
         assistant_id = user_layer.get("assistant_id") or channel_layer.get("assistant_id") or self._default_session.get("assistant_id") or self._assistant_id
         if not isinstance(assistant_id, str) or not assistant_id.strip():
@@ -714,7 +1093,8 @@ class ChannelManager:
             self._default_session.get("context"),
             channel_layer.get("context"),
             user_layer.get("context"),
-            {"thread_id": thread_id},
+            runtime_overrides,
+            {"thread_id": thread_id, "channel_name": msg.channel_name},
         )
 
         # Custom agents are implemented as lead_agent + agent_name context.
@@ -725,6 +1105,17 @@ class ChannelManager:
             assistant_id = DEFAULT_ASSISTANT_ID
 
         return assistant_id, run_config, run_context
+
+    def _resolve_runtime_context_preview(self, msg: InboundMessage) -> dict[str, Any]:
+        channel_layer, user_layer = self._resolve_session_layer(msg)
+        runtime_overrides = self._get_runtime_session_overrides(msg)
+        return _merge_dicts(
+            DEFAULT_RUN_CONTEXT,
+            self._default_session.get("context"),
+            channel_layer.get("context"),
+            user_layer.get("context"),
+            runtime_overrides,
+        )
 
     # -- LangGraph SDK client (lazy) ----------------------------------------
 
@@ -833,13 +1224,13 @@ class ChannelManager:
         client = self._get_client()
 
         # Look up existing DeerFlow thread.
-        # topic_id may be None (e.g. Telegram private chats) — the store
+        # topic_id may be None (e.g. Telegram private chats); the store
         # handles this by using the "channel:chat_id" key without a topic suffix.
         thread_id = self.store.get_thread_id(msg.channel_name, msg.chat_id, topic_id=msg.topic_id)
         if thread_id:
             logger.info("[Manager] reusing thread: thread_id=%s for topic_id=%s", thread_id, msg.topic_id)
 
-        # No existing thread found — create a new one
+        # No existing thread found; create a new one
         if thread_id is None:
             thread_id = await self._create_thread(client, msg)
 
@@ -885,6 +1276,38 @@ class ChannelManager:
 
         response_text = _extract_response_text(result)
         artifacts = _extract_artifacts(result)
+        outbound_metadata: dict[str, Any] = {}
+        feishu_chart_contract_missing = False
+        if msg.channel_name == "feishu":
+            chart_requested = _looks_like_chart_request(msg.text)
+            outbound_metadata["feishu_chart_requested"] = chart_requested
+            contract = _extract_feishu_skill_contract(result)
+            if isinstance(contract, dict):
+                outbound_metadata["feishu_skill_contract"] = contract
+            else:
+                payload = _extract_feishu_card_payload(result)
+                if isinstance(payload, dict):
+                    outbound_metadata["feishu_card_payload"] = payload
+                elif chart_requested:
+                    outbound_metadata["feishu_contract_missing_for_chart"] = True
+                    feishu_chart_contract_missing = True
+            if (
+                chart_requested
+                and "feishu_skill_contract" not in outbound_metadata
+                and "feishu_card_payload" not in outbound_metadata
+            ):
+                outbound_metadata["feishu_contract_missing_for_chart"] = True
+                feishu_chart_contract_missing = True
+            logger.info(
+                "[Manager][Feishu] non-stream extraction decided: source=%s chart_requested=%s response_len=%d",
+                _feishu_payload_source_label(
+                    has_contract="feishu_skill_contract" in outbound_metadata,
+                    has_card_payload="feishu_card_payload" in outbound_metadata,
+                    chart_requested=bool(chart_requested),
+                ),
+                chart_requested,
+                len(response_text) if response_text else 0,
+            )
 
         logger.info(
             "[Manager] agent response received: thread_id=%s, response_len=%d, artifacts=%d",
@@ -895,11 +1318,17 @@ class ChannelManager:
 
         response_text, attachments = _prepare_artifact_delivery(thread_id, response_text, artifacts)
 
+        if msg.channel_name == "feishu" and feishu_chart_contract_missing:
+            response_text = _FEISHU_CHART_CONTRACT_REQUIRED_TEXT
+            attachments = []
+            artifacts = []
+
         if not response_text:
             if attachments:
                 response_text = _format_artifact_text([a.virtual_path for a in attachments])
             else:
                 response_text = "(No response from agent)"
+        response_text = _append_runtime_footer(response_text, run_context, channel_name=msg.channel_name)
 
         outbound = OutboundMessage(
             channel_name=msg.channel_name,
@@ -909,6 +1338,7 @@ class ChannelManager:
             artifacts=artifacts,
             attachments=attachments,
             thread_ts=msg.thread_ts,
+            metadata=outbound_metadata,
         )
         logger.info("[Manager] publishing outbound message to bus: channel=%s, chat_id=%s", msg.channel_name, msg.chat_id)
         await self.bus.publish_outbound(outbound)
@@ -930,41 +1360,92 @@ class ChannelManager:
         last_publish_at = 0.0
         stream_error: BaseException | None = None
         progress_events: list[dict[str, str]] = []
+        progress_timeline: list[dict[str, Any]] = []
         last_status_publish_at = 0.0
         current_stage = "已接收请求"
+        latest_feishu_contract: dict[str, Any] | None = None
+        latest_feishu_card_payload: dict[str, Any] | None = None
+        stream_started_monotonic = time.monotonic()
+        stream_started_at_epoch = time.time()
 
-        async def publish_progress(stage: str, detail: str | None, *, force: bool = False) -> None:
-            nonlocal last_status_publish_at, progress_events, current_stage
+        async def publish_progress(
+            stage: str,
+            detail: str | None,
+            *,
+            force: bool = False,
+            kind: str = "thought",
+            add_to_log: bool = True,
+        ) -> None:
+            nonlocal last_status_publish_at, progress_events, progress_timeline, current_stage
             now = time.monotonic()
             if not force and now - last_status_publish_at < STREAM_STATUS_MIN_INTERVAL_SECONDS:
                 return
             current_stage = stage
-            if detail:
+            elapsed_seconds = max(0, int(now - stream_started_monotonic))
+            if detail and add_to_log:
                 event_item = {"stage": stage, "detail": detail}
                 if not progress_events or progress_events[-1] != event_item:
                     progress_events.append(event_item)
                     progress_events = progress_events[-MAX_PROGRESS_EVENTS:]
+                timeline_item = {
+                    "kind": kind if kind in {"thought", "action"} else "thought",
+                    "stage": stage,
+                    "detail": detail,
+                    "elapsed_seconds": elapsed_seconds,
+                    "at": time.time(),
+                }
+                if (
+                    not progress_timeline
+                    or progress_timeline[-1].get("stage") != timeline_item["stage"]
+                    or progress_timeline[-1].get("detail") != timeline_item["detail"]
+                    or progress_timeline[-1].get("kind") != timeline_item["kind"]
+                ):
+                    progress_timeline.append(timeline_item)
+                    progress_timeline = progress_timeline[-MAX_PROGRESS_TIMELINE_EVENTS:]
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel_name=msg.channel_name,
                     chat_id=msg.chat_id,
                     thread_id=thread_id,
-                    text=latest_text or "正在处理中...",
+                    text=latest_text or "Processing...",
                     is_final=False,
                     thread_ts=msg.thread_ts,
                     metadata={
                         "status_stage": stage,
                         "progress_events": list(progress_events),
+                        "progress_timeline": list(progress_timeline),
+                        "progress_started_at": stream_started_at_epoch,
+                        "progress_elapsed_seconds": elapsed_seconds,
+                        "progress_timer_running": True,
                     },
                 )
             )
             last_status_publish_at = now
 
-        await publish_progress("已接收请求", "消息已接收，准备执行", force=True)
-        await publish_progress("解析需求", "正在分析输入并规划步骤", force=True)
+        await publish_progress("已接收请求", "消息已接收，正在准备执行", force=True, kind="thought")
+        await publish_progress("解析需求", "正在分析输入并规划步骤", force=True, kind="thought")
+
+        heartbeat_stop = asyncio.Event()
+
+        async def heartbeat_loop() -> None:
+            while not heartbeat_stop.is_set():
+                await asyncio.sleep(STREAM_HEARTBEAT_INTERVAL_SECONDS)
+                if heartbeat_stop.is_set():
+                    break
+                elapsed_seconds = max(0, int(time.monotonic() - stream_started_monotonic))
+                await publish_progress(
+                    current_stage,
+                    STREAM_HEARTBEAT_DETAIL,
+                    force=True,
+                    kind="thought",
+                    add_to_log=False,
+                )
+
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
 
         async def run_single_stream_attempt() -> None:
-            nonlocal last_values, latest_text, last_published_text, last_publish_at, current_stage
+            nonlocal last_values, latest_text, last_published_text, last_publish_at
+            nonlocal current_stage, latest_feishu_contract, latest_feishu_card_payload
             streamed_buffers: dict[str, str] = {}
             current_message_id: str | None = None
             async for chunk in client.runs.stream(
@@ -981,22 +1462,48 @@ class ChannelManager:
 
                 if event == "messages-tuple":
                     accumulated_text, current_message_id = _accumulate_stream_text(streamed_buffers, current_message_id, data)
+                    payload = data[0] if isinstance(data, (list, tuple)) and data else data
+                    contract = _extract_feishu_skill_contract_from_stream_payload(payload)
+                    if isinstance(contract, dict):
+                        latest_feishu_contract = contract
+                        logger.info(
+                            "[Manager][Feishu] stream chunk extracted feishu_skill_contract: event=%s msg_id=%s",
+                            event,
+                            current_message_id,
+                        )
+                    else:
+                        payload_metadata = _extract_feishu_card_payload_from_stream_payload(payload)
+                        if isinstance(payload_metadata, dict):
+                            latest_feishu_card_payload = payload_metadata
+                            logger.info(
+                                "[Manager][Feishu] stream chunk extracted feishu_card_payload: event=%s msg_id=%s",
+                                event,
+                                current_message_id,
+                            )
                     if accumulated_text:
                         latest_text = accumulated_text
                         if current_stage not in {"整理答案", "发送结果"}:
-                            await publish_progress("整理答案", "收到模型输出片段", force=True)
-                    payload = data[0] if isinstance(data, (list, tuple)) and data else data
+                            await publish_progress("整理答案", "已接收模型输出片段", force=True, kind="thought")
                     tool_events = _extract_tool_progress_from_payload(payload)
                     for tool_event in tool_events:
-                        await publish_progress(tool_event["stage"], tool_event["detail"], force=True)
+                        await publish_progress(tool_event["stage"], tool_event["detail"], force=True, kind="action")
                     tool_result_events = _extract_tool_result_events_from_payload(payload)
                     for tool_event in tool_result_events:
-                        await publish_progress(tool_event["stage"], tool_event["detail"], force=True)
+                        await publish_progress(tool_event["stage"], tool_event["detail"], force=True, kind="action")
                 elif event == "values" and isinstance(data, (dict, list)):
                     last_values = data
                     snapshot_text = _extract_response_text(data)
                     if snapshot_text:
                         latest_text = snapshot_text
+                    contract = _extract_feishu_skill_contract(data)
+                    if isinstance(contract, dict):
+                        latest_feishu_contract = contract
+                        logger.info("[Manager][Feishu] values snapshot extracted feishu_skill_contract")
+                    else:
+                        payload_metadata = _extract_feishu_card_payload(data)
+                        if isinstance(payload_metadata, dict):
+                            latest_feishu_card_payload = payload_metadata
+                            logger.info("[Manager][Feishu] values snapshot extracted feishu_card_payload")
 
                 if not latest_text or latest_text == last_published_text:
                     stage = _derive_stage_from_event(
@@ -1005,7 +1512,7 @@ class ChannelManager:
                         latest_text,
                         current_stage,
                     )
-                    await publish_progress(stage, None)
+                    await publish_progress(stage, None, kind="thought")
                     continue
 
                 now = time.monotonic()
@@ -1023,6 +1530,10 @@ class ChannelManager:
                         metadata={
                             "status_stage": "整理答案",
                             "progress_events": list(progress_events),
+                            "progress_timeline": list(progress_timeline),
+                            "progress_started_at": stream_started_at_epoch,
+                            "progress_elapsed_seconds": max(0, int(time.monotonic() - stream_started_monotonic)),
+                            "progress_timer_running": True,
                         },
                     )
                 )
@@ -1031,13 +1542,42 @@ class ChannelManager:
 
         try:
             max_attempts = self._stream_max_retries + 1
-            for attempt in range(1, max_attempts + 1):
+            recreated_thread_once = False
+            recreated_busy_thread_once = False
+            attempt = 1
+            while attempt <= max_attempts:
                 try:
                     await asyncio.wait_for(run_single_stream_attempt(), timeout=self._stream_attempt_timeout_seconds)
                     stream_error = None
                     break
                 except Exception as exc:
                     stream_error = exc
+                    if _is_thread_or_assistant_not_found_error(exc) and not recreated_thread_once:
+                        logger.warning(
+                            "[Manager] stream target missing, recreating thread and retrying once: thread_id=%s",
+                            thread_id,
+                        )
+                        await publish_progress("异常处理中", "会话状态过期，正在重建线程", force=True, kind="action")
+                        thread_id = await self._create_thread(client, msg)
+                        run_context["thread_id"] = thread_id
+                        recreated_thread_once = True
+                        max_attempts += 1
+                        await publish_progress("重试中", "线程已重建，正在重试请求", force=True, kind="action")
+                        attempt += 1
+                        continue
+                    if _is_thread_busy_error(exc) and not recreated_busy_thread_once:
+                        logger.warning(
+                            "[Manager] thread busy, recreating thread and retrying once: old_thread_id=%s",
+                            thread_id,
+                        )
+                        await publish_progress("异常处理中", "上一轮会话仍在处理中，正在新建会话重试", force=True, kind="action")
+                        thread_id = await self._create_thread(client, msg)
+                        run_context["thread_id"] = thread_id
+                        recreated_busy_thread_once = True
+                        max_attempts += 1
+                        await publish_progress("重试中", "新会话已创建，正在重试请求", force=True, kind="action")
+                        attempt += 1
+                        continue
                     if _is_thread_busy_error(exc):
                         logger.warning("[Manager] thread busy (concurrent run rejected): thread_id=%s", thread_id)
                     else:
@@ -1047,16 +1587,23 @@ class ChannelManager:
                             attempt,
                             max_attempts,
                         )
-                    error_label = "流式超时" if isinstance(exc, asyncio.TimeoutError) else exc.__class__.__name__
-                    await publish_progress("异常处理中", f"第{attempt}次失败: {error_label}", force=True)
+                    error_label = "stream_timeout" if isinstance(exc, asyncio.TimeoutError) else exc.__class__.__name__
+                    await publish_progress("异常处理中", f"Attempt {attempt} failed: {error_label}", force=True, kind="action")
                     if attempt < max_attempts and _is_retryable_stream_error(exc):
                         delay = min(self._stream_retry_base_delay_seconds * attempt, 2.0)
-                        await publish_progress("重试中", f"第{attempt + 1}次重试，{delay:.1f}s 后继续", force=True)
+                        await publish_progress("重试中", f"重试：attempt {attempt + 1} in {delay:.1f}s", force=True, kind="action")
                         await asyncio.sleep(delay)
-                        await publish_progress("检索/读取资料", f"已发起第{attempt + 1}次尝试", force=True)
+                        await publish_progress("检索/读取资料", f"开始第 {attempt + 1} 次尝试", force=True, kind="thought")
+                        attempt += 1
                         continue
                     break
         finally:
+            heartbeat_stop.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
             result = last_values if last_values is not None else {"messages": [{"type": "ai", "content": latest_text}]}
             response_text = _extract_response_text(result)
             artifacts = _extract_artifacts(result)
@@ -1072,6 +1619,7 @@ class ChannelManager:
                         response_text = "An error occurred while processing your request. Please try again."
                 else:
                     response_text = latest_text or "(No response from agent)"
+            response_text = _append_runtime_footer(response_text, run_context, channel_name=msg.channel_name)
 
             logger.info(
                 "[Manager] streaming response completed: thread_id=%s, response_len=%d, artifacts=%d, error=%s",
@@ -1080,7 +1628,44 @@ class ChannelManager:
                 len(artifacts),
                 stream_error,
             )
-            await publish_progress("发送结果", "正在发送最终结果", force=True)
+            final_elapsed_seconds = max(0, int(time.monotonic() - stream_started_monotonic))
+            final_metadata: dict[str, Any] = {
+                "status_stage": "发送结果",
+                "progress_events": list(progress_events),
+                "progress_timeline": list(progress_timeline),
+                "progress_started_at": stream_started_at_epoch,
+                "progress_elapsed_seconds": final_elapsed_seconds,
+                "progress_timer_running": False,
+            }
+            if msg.channel_name == "feishu":
+                chart_requested = _looks_like_chart_request(msg.text)
+                final_metadata["feishu_chart_requested"] = chart_requested
+                feishu_chart_contract_missing = False
+                if not isinstance(latest_feishu_contract, dict):
+                    latest_feishu_contract = _extract_feishu_skill_contract(result)
+                if not isinstance(latest_feishu_card_payload, dict):
+                    latest_feishu_card_payload = _extract_feishu_card_payload(result)
+                if isinstance(latest_feishu_contract, dict):
+                    final_metadata["feishu_skill_contract"] = latest_feishu_contract
+                elif isinstance(latest_feishu_card_payload, dict):
+                    final_metadata["feishu_card_payload"] = latest_feishu_card_payload
+                elif chart_requested:
+                    final_metadata["feishu_contract_missing_for_chart"] = True
+                    feishu_chart_contract_missing = True
+                if feishu_chart_contract_missing:
+                    response_text = _FEISHU_CHART_CONTRACT_REQUIRED_TEXT
+                    attachments = []
+                    artifacts = []
+                logger.info(
+                    "[Manager][Feishu] final metadata decided: source=%s chart_requested=%s text_len=%d",
+                    _feishu_payload_source_label(
+                        has_contract="feishu_skill_contract" in final_metadata,
+                        has_card_payload="feishu_card_payload" in final_metadata,
+                        chart_requested=bool(chart_requested),
+                    ),
+                    chart_requested,
+                    len(response_text),
+                )
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel_name=msg.channel_name,
@@ -1091,10 +1676,7 @@ class ChannelManager:
                     attachments=attachments,
                     is_final=True,
                     thread_ts=msg.thread_ts,
-                    metadata={
-                        "status_stage": "发送结果",
-                        "progress_events": list(progress_events),
-                    },
+                    metadata=final_metadata,
                 )
             )
 
@@ -1104,6 +1686,7 @@ class ChannelManager:
         text = msg.text.strip()
         parts = text.split(maxsplit=1)
         command = parts[0].lower().lstrip("/")
+        args_text = parts[1].strip() if len(parts) > 1 else ""
 
         if command == "bootstrap":
             from dataclasses import replace as _dc_replace
@@ -1131,17 +1714,160 @@ class ChannelManager:
             reply = f"Active thread: {thread_id}" if thread_id else "No active conversation."
         elif command == "models":
             reply = await self._fetch_gateway("/api/models", "models")
+        elif command == "model":
+            if not args_text:
+                current = self._get_runtime_session_overrides(msg)
+                model_name = current.get("model_name")
+                reply = f"Current model override: {model_name}" if isinstance(model_name, str) and model_name else "Current model override: (default)"
+            else:
+                raw = args_text.strip()
+                lowered = raw.lower()
+                if lowered in {"default", "reset", "clear"}:
+                    current = self._get_runtime_session_overrides(msg)
+                    current.pop("model_name", None)
+                    self.store.set_session_overrides(
+                        msg.channel_name,
+                        msg.chat_id,
+                        current,
+                        topic_id=msg.topic_id,
+                        user_id=msg.user_id,
+                    )
+                    reply = "Model override reset to default."
+                else:
+                    current = self._get_runtime_session_overrides(msg)
+                    current["model_name"] = raw
+                    self.store.set_session_overrides(
+                        msg.channel_name,
+                        msg.chat_id,
+                        current,
+                        topic_id=msg.topic_id,
+                        user_id=msg.user_id,
+                    )
+                    reply = f"Model override updated: {raw}"
+        elif command == "mode":
+            if not args_text:
+                current = self._get_runtime_session_overrides(msg)
+                reply = _format_session_summary(current)
+            else:
+                tokens = [token.strip().lower() for token in args_text.split() if token.strip()]
+                if len(tokens) != 2:
+                    reply = "Usage: /mode <plan|subagent|reasoning> <on|off|minimal|low|medium|high|default>"
+                else:
+                    key, value = tokens
+                    current = self._get_runtime_session_overrides(msg)
+                    if key == "plan":
+                        if value in {"on", "true", "1"}:
+                            current["is_plan_mode"] = True
+                            reply = "Mode updated: is_plan_mode=true"
+                        elif value in {"off", "false", "0"}:
+                            current["is_plan_mode"] = False
+                            reply = "Mode updated: is_plan_mode=false"
+                        elif value in {"default", "reset", "clear"}:
+                            current.pop("is_plan_mode", None)
+                            reply = "Mode reset: is_plan_mode=(default)"
+                        else:
+                            reply = "Invalid value for plan. Use on|off|default."
+                    elif key == "subagent":
+                        if value in {"on", "true", "1"}:
+                            current["subagent_enabled"] = True
+                            reply = "Mode updated: subagent_enabled=true"
+                        elif value in {"off", "false", "0"}:
+                            current["subagent_enabled"] = False
+                            reply = "Mode updated: subagent_enabled=false"
+                        elif value in {"default", "reset", "clear"}:
+                            current.pop("subagent_enabled", None)
+                            reply = "Mode reset: subagent_enabled=(default)"
+                        else:
+                            reply = "Invalid value for subagent. Use on|off|default."
+                    elif key == "reasoning":
+                        if value in _ALLOWED_REASONING_EFFORTS:
+                            current["reasoning_effort"] = value
+                            reply = f"Mode updated: reasoning_effort={value}"
+                        elif value in {"default", "reset", "clear"}:
+                            current.pop("reasoning_effort", None)
+                            reply = "Mode reset: reasoning_effort=(default)"
+                        else:
+                            reply = "Invalid value for reasoning. Use minimal|low|medium|high|default."
+                    else:
+                        reply = "Invalid mode key. Use plan|subagent|reasoning."
+
+                    if not reply.startswith("Invalid") and not reply.startswith("Usage"):
+                        self.store.set_session_overrides(
+                            msg.channel_name,
+                            msg.chat_id,
+                            current,
+                            topic_id=msg.topic_id,
+                            user_id=msg.user_id,
+                        )
+        elif command == "preset":
+            preset = args_text.strip().lower()
+            current = self._get_runtime_session_overrides(msg)
+            if preset == "flash":
+                current["is_plan_mode"] = False
+                current["subagent_enabled"] = False
+                current["reasoning_effort"] = "minimal"
+                reply = "Preset applied: flash (plan=false, subagent=false, reasoning=minimal)"
+            elif preset == "thinking":
+                current["is_plan_mode"] = False
+                current["subagent_enabled"] = False
+                current["reasoning_effort"] = "low"
+                reply = "Preset applied: thinking (plan=false, subagent=false, reasoning=low)"
+            elif preset == "pro":
+                current["is_plan_mode"] = True
+                current["subagent_enabled"] = False
+                current["reasoning_effort"] = "medium"
+                reply = "Preset applied: pro (plan=true, subagent=false, reasoning=medium)"
+            elif preset == "ultra":
+                current["is_plan_mode"] = True
+                current["subagent_enabled"] = True
+                current["reasoning_effort"] = "high"
+                reply = "Preset applied: ultra (plan=true, subagent=true, reasoning=high)"
+            elif preset in {"default", "reset", "clear"}:
+                current.pop("is_plan_mode", None)
+                current.pop("subagent_enabled", None)
+                current.pop("reasoning_effort", None)
+                reply = "Preset reset: mode overrides restored to defaults."
+            else:
+                reply = "Usage: /preset <flash|thinking|pro|ultra|default>"
+
+            if not reply.startswith("Usage"):
+                self.store.set_session_overrides(
+                    msg.channel_name,
+                    msg.chat_id,
+                    current,
+                    topic_id=msg.topic_id,
+                    user_id=msg.user_id,
+                )
+                if preset in {"flash", "thinking", "pro", "ultra"}:
+                    reply = f"{reply}\nMenu feedback: switched to `{preset}` mode."
+        elif command == "session":
+            current = self._get_runtime_session_overrides(msg)
+            if args_text.lower() in {"reset", "clear", "default"}:
+                self.store.set_session_overrides(
+                    msg.channel_name,
+                    msg.chat_id,
+                    {},
+                    topic_id=msg.topic_id,
+                    user_id=msg.user_id,
+                )
+                reply = "Session overrides reset to defaults."
+            else:
+                reply = _format_session_summary(current)
         elif command == "memory":
             reply = await self._fetch_gateway("/api/memory", "memory")
         elif command == "help":
             reply = (
                 "Available commands:\n"
-                "/bootstrap — Start a bootstrap session (enables agent setup)\n"
-                "/new — Start a new conversation\n"
-                "/status — Show current thread info\n"
-                "/models — List available models\n"
-                "/memory — Show memory status\n"
-                "/help — Show this help"
+                "/bootstrap -Start a bootstrap session (enables agent setup)\n"
+                "/new -Start a new conversation\n"
+                "/status -Show current thread info\n"
+                "/models -List available models\n"
+                "/model <name|default> -Set model override for this conversation/user\n"
+                "/mode <plan|subagent|reasoning> <on|off|minimal|low|medium|high|default> -Set run mode overrides\n"
+                "/preset <flash|thinking|pro|ultra|default> -Apply DeerFlow web-equivalent mode preset\n"
+                "/session [reset] -Show or reset session overrides\n"
+                "/memory -Show memory status\n"
+                "/help -Show this help"
             )
         else:
             available = " | ".join(sorted(KNOWN_CHANNEL_COMMANDS))
@@ -1151,7 +1877,11 @@ class ChannelManager:
             channel_name=msg.channel_name,
             chat_id=msg.chat_id,
             thread_id=self.store.get_thread_id(msg.channel_name, msg.chat_id) or "",
-            text=reply,
+            text=_append_runtime_footer(
+                reply,
+                self._resolve_runtime_context_preview(msg),
+                channel_name=msg.channel_name,
+            ),
             thread_ts=msg.thread_ts,
         )
         await self.bus.publish_outbound(outbound)
@@ -1171,7 +1901,7 @@ class ChannelManager:
 
         if kind == "models":
             names = [m["name"] for m in data.get("models", [])]
-            return ("Available models:\n" + "\n".join(f"• {n}" for n in names)) if names else "No models configured."
+            return ("Available models:\n" + "\n".join(f"- {n}" for n in names)) if names else "No models configured."
         elif kind == "memory":
             facts = data.get("facts", [])
             return f"Memory contains {len(facts)} fact(s)."
@@ -1184,7 +1914,11 @@ class ChannelManager:
             channel_name=msg.channel_name,
             chat_id=msg.chat_id,
             thread_id=self.store.get_thread_id(msg.channel_name, msg.chat_id) or "",
-            text=error_text,
+            text=_append_runtime_footer(
+                error_text,
+                self._resolve_runtime_context_preview(msg),
+                channel_name=msg.channel_name,
+            ),
             thread_ts=msg.thread_ts,
         )
         await self.bus.publish_outbound(outbound)

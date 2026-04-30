@@ -31,6 +31,13 @@ class Channel(ABC):
     def is_running(self) -> bool:
         return self._running
 
+    def get_runtime_metrics(self) -> dict[str, Any]:
+        """Return runtime metrics for status endpoints.
+
+        Subclasses can override this to expose channel-specific counters.
+        """
+        return {}
+
     # -- lifecycle ---------------------------------------------------------
 
     @abstractmethod

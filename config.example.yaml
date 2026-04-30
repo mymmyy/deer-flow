@@ -821,6 +821,14 @@ checkpointer:
 #     # Context isolation strategy for mapping Feishu messages to DeerFlow threads.
 #     # chat/group: one thread per chat_id, topic: one thread per topic(root_id/message_id)
 #     context_boundary: chat
+#     # In group chats, only respond when the bot is explicitly @mentioned.
+#     # Private chats and known slash commands are not affected.
+#     require_mention_in_group: true
+#     # Optional: improves precise @ matching and mention cleanup when Feishu
+#     # sends structured mention targets. Text placeholder mentions like
+#     # @_user_1 are also supported when these are not configured.
+#     # bot_open_id: ou_xxx
+#     # bot_name: DeerFlow
 #     # Whether to reply inside Feishu thread/topic.
 #     # false: reply in normal chat stream, true: reply in thread
 #     reply_in_thread: false

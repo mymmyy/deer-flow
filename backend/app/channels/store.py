@@ -106,6 +106,83 @@ class ChannelStore:
             }
             self._save()
 
+    def get_session_overrides(
+        self,
+        channel_name: str,
+        chat_id: str,
+        *,
+        topic_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return persisted per-conversation/per-user session overrides."""
+        key = self._key(channel_name, chat_id, topic_id)
+        entry = self._data.get(key)
+        if not isinstance(entry, dict):
+            return {}
+
+        session = entry.get("session")
+        if not isinstance(session, dict):
+            return {}
+
+        if not user_id:
+            shared = session.get("shared")
+            return dict(shared) if isinstance(shared, dict) else {}
+
+        users = session.get("users")
+        if not isinstance(users, dict):
+            return {}
+        user_session = users.get(user_id)
+        return dict(user_session) if isinstance(user_session, dict) else {}
+
+    def set_session_overrides(
+        self,
+        channel_name: str,
+        chat_id: str,
+        overrides: dict[str, Any],
+        *,
+        topic_id: str | None = None,
+        user_id: str | None = None,
+    ) -> None:
+        """Persist per-conversation/per-user session overrides."""
+        with self._lock:
+            key = self._key(channel_name, chat_id, topic_id)
+            now = time.time()
+            existing = self._data.get(key)
+            if not isinstance(existing, dict):
+                existing = {
+                    "thread_id": "",
+                    "user_id": user_id or "",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+
+            session = existing.get("session")
+            if not isinstance(session, dict):
+                session = {"shared": {}, "users": {}}
+            shared = session.get("shared")
+            if not isinstance(shared, dict):
+                shared = {}
+            users = session.get("users")
+            if not isinstance(users, dict):
+                users = {}
+
+            sanitized = dict(overrides)
+            if user_id:
+                if sanitized:
+                    users[user_id] = sanitized
+                else:
+                    users.pop(user_id, None)
+            else:
+                shared = sanitized
+
+            session["shared"] = shared
+            session["users"] = users
+
+            existing["session"] = session
+            existing["updated_at"] = now
+            self._data[key] = existing
+            self._save()
+
     def remove(self, channel_name: str, chat_id: str, topic_id: str | None = None) -> bool:
         """Remove a mapping.
 

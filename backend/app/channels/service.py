@@ -159,10 +159,20 @@ class ChannelService:
         for name in _CHANNEL_REGISTRY:
             config = self._config.get(name, {})
             enabled = isinstance(config, dict) and config.get("enabled", False)
-            running = name in self._channels and self._channels[name].is_running
+            channel = self._channels.get(name)
+            running = bool(channel and channel.is_running)
+            metrics: dict[str, Any] = {}
+            if channel and hasattr(channel, "get_runtime_metrics"):
+                try:
+                    raw_metrics = channel.get_runtime_metrics()
+                    if isinstance(raw_metrics, dict):
+                        metrics = raw_metrics
+                except Exception:
+                    logger.exception("Failed to get runtime metrics for channel %s", name)
             channels_status[name] = {
                 "enabled": enabled,
                 "running": running,
+                "metrics": metrics,
             }
         return {
             "service_running": self._running,

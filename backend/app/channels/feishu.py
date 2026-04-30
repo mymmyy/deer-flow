@@ -7,10 +7,11 @@ import json
 import logging
 import re
 import threading
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from app.channels.base import Channel
 from app.channels.commands import KNOWN_CHANNEL_COMMANDS
+from app.channels.feishu_contract import validate_and_normalize_contract
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
@@ -20,13 +21,208 @@ logger = logging.getLogger(__name__)
 _ALLOWED_CONTEXT_BOUNDARIES = {"chat", "group", "topic"}
 _ALLOWED_CARD_STYLES = {"markdown", "rich"}
 _ALLOWED_RENDER_MODES = {"auto", "card", "text"}
-_TIME_KEYWORDS = ("date", "time", "day", "week", "month", "year", "日期", "时间", "日", "周", "月", "年")
+_FEISHU_GROUP_CHAT_TYPES = {"group"}
+_FEISHU_TEXT_MENTION_RE = re.compile(r"@_user_\d+\b")
+_SCRIPT_PERMISSION_QUERY_MARKERS = (
+    "是否允许我执行该脚本",
+    "允许执行脚本",
+    "执行脚本",
+    "允许我执行",
+    "allow me to execute",
+    "allow script execution",
+)
+_FEISHU_CONTRACT_GUARDRAIL_TEXT = (
+    "该请求需要以飞书卡片契约输出图表，已禁止脚本执行链路。"
+    "请直接返回 `feishu_skill_contract` 或 `feishu_card_payload.chart_spec` 对应的卡片结果；"
+    "若暂不可用，先返回文本趋势摘要。"
+)
+
+
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*]\([^)]+\)")
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+_MENU_EVENT_KEY_TO_COMMAND: dict[str, str] = {
+    "model:gpt-5.2": "/model gpt-5.2",
+    "model:qwen3.5-plus": "/model qwen3.5-plus",
+    "mode:flash": "/preset flash",
+    "mode:thinking": "/preset thinking",
+    "mode:pro": "/preset pro",
+    "mode:ultra": "/preset ultra",
+    "mode:plan_on": "/mode plan on",
+    "mode:plan_off": "/mode plan off",
+    "mode:subagent_on": "/mode subagent on",
+    "mode:subagent_off": "/mode subagent off",
+    "mode:reasoning_low": "/mode reasoning low",
+    "mode:reasoning_medium": "/mode reasoning medium",
+    "mode:reasoning_high": "/mode reasoning high",
+    "mode:reasoning_default": "/mode reasoning default",
+    "session:reset": "/session reset",
+}
+
+
+def _normalize_menu_event_mapping(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, Mapping):
+        return dict(_MENU_EVENT_KEY_TO_COMMAND)
+    normalized: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        key = k.strip().lower()
+        value = v.strip()
+        if key and value:
+            normalized[key] = value
+    return normalized or dict(_MENU_EVENT_KEY_TO_COMMAND)
+
+
+def _safe_get(source: Any, key: str, default: Any = None) -> Any:
+    if isinstance(source, Mapping):
+        return source.get(key, default)
+    return getattr(source, key, default)
+
+
+def _first_non_empty_str(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text
+    return ""
+
+
+def _path_get(source: Any, path: str) -> Any:
+    current = source
+    for part in path.split("."):
+        if current is None:
+            return None
+        current = _safe_get(current, part)
+    return current
+
+
+def _sanitize_for_log(value: Any) -> Any:
+    """Best-effort event payload sanitizer for diagnostics."""
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, inner in value.items():
+            key_str = str(key)
+            lowered = key_str.lower()
+            if any(token in lowered for token in ("token", "secret", "sign", "access_key", "ticket")):
+                sanitized[key_str] = "***"
+            else:
+                sanitized[key_str] = _sanitize_for_log(inner)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_for_log(item) for item in value[:20]]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_for_log(item) for item in value[:20])
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "__dict__"):
+        return _sanitize_for_log(vars(value))
+    return str(value)
+
+
+def _sanitize_markdown_for_feishu_card(content: str) -> str:
+    """Strip markdown image syntax that Feishu rejects without image_key."""
+    if not content:
+        return content
+    sanitized = _MARKDOWN_IMAGE_RE.sub("[image omitted]", content)
+    return sanitized
+
+
+def _resolve_receive_id_type(receive_id: str) -> str:
+    value = str(receive_id or "").strip()
+    return "open_id" if value.startswith("ou_") else "chat_id"
+
+
+def _extract_json_mappings_from_text(text: str) -> list[dict[str, Any]]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    candidates: list[str] = [raw]
+    for match in _JSON_FENCE_RE.finditer(raw):
+        block = match.group(1).strip()
+        if block:
+            candidates.append(block)
+
+    decoder = json.JSONDecoder()
+    mappings: list[dict[str, Any]] = []
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, Mapping):
+                mappings.append(dict(parsed))
+            continue
+        except Exception:
+            pass
+
+        idx = 0
+        while idx < len(candidate):
+            if candidate[idx] != "{":
+                idx += 1
+                continue
+            try:
+                parsed_obj, end = decoder.raw_decode(candidate[idx:])
+            except Exception:
+                idx += 1
+                continue
+            if isinstance(parsed_obj, Mapping):
+                mappings.append(dict(parsed_obj))
+            idx += max(end, 1)
+    return mappings
+
+
+def _extract_embedded_feishu_payloads(text: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    for parsed in _extract_json_mappings_from_text(text):
+        direct_contract = parsed.get("feishu_skill_contract")
+        if isinstance(direct_contract, Mapping):
+            return dict(direct_contract), None
+        direct_payload = parsed.get("feishu_card_payload")
+        if isinstance(direct_payload, Mapping):
+            return None, dict(direct_payload)
+
+        metadata = parsed.get("metadata")
+        if isinstance(metadata, Mapping):
+            nested_contract = metadata.get("feishu_skill_contract")
+            if isinstance(nested_contract, Mapping):
+                return dict(nested_contract), None
+            nested_payload = metadata.get("feishu_card_payload")
+            if isinstance(nested_payload, Mapping):
+                return None, dict(nested_payload)
+    return None, None
+
+
+def _contract_summary(contract: Mapping[str, Any]) -> str:
+    version = str(contract.get("card_schema_version") or "")
+    target = str(contract.get("target_channel") or "")
+    mode = str(contract.get("render_mode") or "")
+    return f"version={version} target={target} mode={mode}"
+
+
+def _format_elapsed_duration(raw_seconds: Any) -> str:
+    try:
+        total = int(raw_seconds)
+    except (TypeError, ValueError):
+        total = 0
+    total = max(0, total)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    seconds = total % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 
 def _is_feishu_command(text: str) -> bool:
     if not text.startswith("/"):
         return False
     return text.split(maxsplit=1)[0].lower() in KNOWN_CHANNEL_COMMANDS
+
+
+def _apply_script_permission_guardrail(text: str) -> str:
+    lowered = text.lower()
+    if any(marker.lower() in lowered for marker in _SCRIPT_PERMISSION_QUERY_MARKERS):
+        return _FEISHU_CONTRACT_GUARDRAIL_TEXT
+    return text
 
 
 class FeishuChannel(Channel):
@@ -40,7 +236,7 @@ class FeishuChannel(Channel):
     The channel uses WebSocket long-connection mode so no public IP is required.
 
     Message flow:
-        1. User sends a message 鈫?bot adds "OK" emoji reaction
+        1. User sends a message; bot adds "OK" emoji reaction
         2. Bot replies in thread: "Working on it......"
         3. Agent processes the message and returns a result
         4. Bot replies in thread with the result
@@ -53,6 +249,10 @@ class FeishuChannel(Channel):
         self._reply_in_thread = self._parse_bool(config.get("reply_in_thread"), default=False)
         self._card_style = self._normalize_card_style(config.get("card_style", "rich"))
         self._render_mode = self._normalize_render_mode(config.get("render_mode", "auto"))
+        self._require_mention_in_group = self._parse_bool(config.get("require_mention_in_group"), default=True)
+        self._bot_open_id = str(config.get("bot_open_id") or "").strip()
+        self._bot_name = str(config.get("bot_name") or "").strip().lstrip("@")
+        self._menu_event_key_to_command = _normalize_menu_event_mapping(config.get("menu_event_key_to_command"))
         self._thread: threading.Thread | None = None
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._api_client = None
@@ -66,6 +266,9 @@ class FeishuChannel(Channel):
         self._running_card_tasks: dict[str, asyncio.Task] = {}
         self._message_render_modes: dict[str, str] = {}
         self._running_card_last_payload: dict[str, str] = {}
+        self._user_last_chat_id: dict[str, str] = {}
+        self._script_permission_guardrail_hits = 0
+        self._contract_missing_for_chart_hits = 0
         self._CreateFileRequest = None
         self._CreateFileRequestBody = None
         self._CreateImageRequest = None
@@ -78,8 +281,12 @@ class FeishuChannel(Channel):
             self._reply_in_thread,
             self._card_style,
         )
-        logger.info("[Feishu] config loaded: render_mode=%s", self._render_mode)
-
+        logger.info(
+            "[Feishu] config loaded: render_mode=%s, require_mention_in_group=%s, menu_event_mappings=%d",
+            self._render_mode,
+            self._require_mention_in_group,
+            len(self._menu_event_key_to_command),
+        )
     @staticmethod
     def _parse_bool(raw: Any, *, default: bool) -> bool:
         if isinstance(raw, bool):
@@ -133,42 +340,100 @@ class FeishuChannel(Channel):
         return chat_id
 
     @staticmethod
-    def _has_markdown_table(text: str) -> bool:
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if len(lines) < 2:
+    def _is_group_message(message: Any) -> bool:
+        chat_type = str(_safe_get(message, "chat_type", "") or "").strip().lower()
+        return chat_type in _FEISHU_GROUP_CHAT_TYPES
+
+    @staticmethod
+    def _extract_at_mentions(content: Mapping[str, Any], message: Any) -> list[dict[str, Any]]:
+        mentions: list[dict[str, Any]] = []
+
+        def add_mention(raw: Any) -> None:
+            if not isinstance(raw, Mapping):
+                return
+            user_id = _first_non_empty_str(
+                raw.get("user_id"),
+                raw.get("open_id"),
+                raw.get("id"),
+                _path_get(raw, "id.open_id"),
+                _path_get(raw, "user_id.open_id"),
+            )
+            text = _first_non_empty_str(raw.get("text"), raw.get("name"), raw.get("user_name"), raw.get("tenant_key"))
+            mentions.append({"user_id": user_id, "text": text})
+
+        raw_mentions = _safe_get(message, "mentions", None)
+        if isinstance(raw_mentions, list):
+            for mention in raw_mentions:
+                add_mention(mention)
+
+        rich_content = content.get("content")
+        if isinstance(rich_content, list):
+            for paragraph in rich_content:
+                if not isinstance(paragraph, list):
+                    continue
+                for element in paragraph:
+                    if isinstance(element, Mapping) and element.get("tag") == "at":
+                        add_mention(element)
+
+        plain_text = content.get("text")
+        if isinstance(plain_text, str):
+            for match in _FEISHU_TEXT_MENTION_RE.finditer(plain_text):
+                mentions.append({"user_id": "", "text": match.group(0), "placeholder": True})
+
+        return mentions
+
+    def _is_bot_mentioned(self, mentions: list[dict[str, Any]]) -> bool:
+        if not mentions:
             return False
-        for idx in range(len(lines) - 1):
-            if "|" not in lines[idx] or "|" not in lines[idx + 1]:
-                continue
-            if re.search(r"^\|?[\s:-]+\|[\s|:-]*\|?$", lines[idx + 1]):
+
+        if self._bot_open_id:
+            if any(mention.get("user_id") == self._bot_open_id for mention in mentions):
                 return True
-        return False
+
+        if self._bot_name:
+            expected = self._bot_name.strip().lstrip("@")
+            if any(mention.get("text", "").strip().lstrip("@") == expected for mention in mentions):
+                return True
+
+        # Some Feishu text events collapse mentions to placeholders like
+        # @_user_1 and omit the target open_id/name. Keep this fallback narrow:
+        # it only wakes the bot when Feishu provided an explicit mention marker.
+        return any(mention.get("placeholder") is True for mention in mentions)
+
+    def _strip_bot_mentions(self, text: str, mentions: list[dict[str, Any]]) -> str:
+        cleaned = text
+        for mention in mentions:
+            mention_text = mention.get("text", "").strip()
+            if not mention_text:
+                continue
+            if self._bot_open_id and mention.get("user_id") != self._bot_open_id:
+                if mention.get("placeholder") is not True:
+                    continue
+            if self._bot_name and mention_text.lstrip("@") != self._bot_name and mention.get("placeholder") is not True:
+                continue
+            cleaned = cleaned.replace(mention_text, " ")
+        return re.sub(r"[ \t]+", " ", cleaned).strip()
 
     def _is_visual_content(self, msg: OutboundMessage) -> bool:
         metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
-        if isinstance(metadata.get("native_card"), dict):
+        if isinstance(metadata.get("feishu_skill_contract"), dict):
             return True
-        if isinstance(metadata.get("feishu_card_payload"), dict):
+        payload = metadata.get("feishu_card_payload")
+        if isinstance(payload, dict) and isinstance(payload.get("chart_spec"), dict):
             return True
-        if any(key in metadata for key in ("line_chart", "bar_chart", "chart_spec", "chart_data")):
-            return True
-
-        text = msg.text or ""
-        if self._has_markdown_table(text):
-            return True
-
-        lowered = text.lower()
-        signal_terms = (
-            "line chart",
-            "bar chart",
-            "chart_spec",
-        )
-        return any(term in lowered for term in signal_terms)
+        return False
 
     def _resolve_render_mode_for_message(self, msg: OutboundMessage) -> str:
         source_message_id = msg.thread_ts
         if source_message_id and source_message_id in self._message_render_modes:
-            return self._message_render_modes[source_message_id]
+            cached = self._message_render_modes[source_message_id]
+            # Auto mode can start as text during streaming progress updates.
+            # If a later chunk/final message carries explicit visual payload,
+            # upgrade this source message to card rendering.
+            if self._render_mode == "auto" and cached == "text" and self._is_visual_content(msg):
+                self._message_render_modes[source_message_id] = "card"
+                return "card"
+            return cached
 
         if self._render_mode == "auto":
             resolved = "card" if self._is_visual_content(msg) else "text"
@@ -189,156 +454,13 @@ class FeishuChannel(Channel):
         return "\n".join([header, separator, *body])
 
     @staticmethod
-    def _parse_markdown_table(text: str) -> tuple[list[str], list[list[str]]] | None:
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        for idx in range(len(lines) - 1):
-            header_line = lines[idx]
-            divider_line = lines[idx + 1]
-            if "|" not in header_line or "|" not in divider_line:
-                continue
-            if not re.match(r"^\|?[\s:-]+\|[\s|:-]*\|?$", divider_line):
-                continue
-
-            def parse_row(row: str) -> list[str]:
-                raw = row.strip()
-                if raw.startswith("|"):
-                    raw = raw[1:]
-                if raw.endswith("|"):
-                    raw = raw[:-1]
-                return [cell.strip() for cell in raw.split("|")]
-
-            columns = parse_row(header_line)
-            rows: list[list[str]] = []
-            for row_line in lines[idx + 2 :]:
-                if "|" not in row_line:
-                    break
-                row = parse_row(row_line)
-                if len(row) < len(columns):
-                    row.extend([""] * (len(columns) - len(row)))
-                rows.append(row[: len(columns)])
-
-            if columns and rows:
-                return columns, rows
-        return None
-
-    @staticmethod
-    def _parse_number(raw: str) -> float | None:
-        value = raw.strip().replace(",", "")
-        if not value:
-            return None
-        if value.endswith("%"):
-            value = value[:-1]
-        try:
-            return float(value)
-        except ValueError:
-            return None
-
-    @staticmethod
-    def _is_time_dimension(column: str) -> bool:
-        lowered = column.strip().lower()
-        return any(keyword in lowered for keyword in _TIME_KEYWORDS)
-
-    def _infer_table_schema(self, columns: list[str], rows: list[list[str]]) -> tuple[list[int], list[int]]:
-        metric_indexes: list[int] = []
-        for col_idx, _ in enumerate(columns):
-            numeric_cells = 0
-            total_cells = 0
-            for row in rows:
-                if col_idx >= len(row):
-                    continue
-                total_cells += 1
-                if self._parse_number(row[col_idx]) is not None:
-                    numeric_cells += 1
-            if total_cells > 0 and numeric_cells / total_cells >= 0.6:
-                metric_indexes.append(col_idx)
-
-        dimension_indexes = [idx for idx in range(len(columns)) if idx not in metric_indexes]
-        if not dimension_indexes and columns:
-            dimension_indexes = [0]
-            if 0 in metric_indexes:
-                metric_indexes.remove(0)
-        return dimension_indexes, metric_indexes
-
-    @staticmethod
-    def _build_table_card(columns: list[str], rows: list[list[str]], title: str = "数据表") -> dict[str, Any]:
+    def _build_table_card(columns: list[str], rows: list[list[str]], title: str = "Data Table") -> dict[str, Any]:
         markdown_table = FeishuChannel._build_markdown_table(columns, rows)
         return {
             "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {"title": {"tag": "plain_text", "content": title}},
             "elements": [{"tag": "markdown", "content": markdown_table}],
         }
-
-    def _build_chart_card(
-        self,
-        *,
-        chart_type: str,
-        dimension_index: int,
-        metric_indexes: list[int],
-        columns: list[str],
-        rows: list[list[str]],
-    ) -> dict[str, Any]:
-        categories = [row[dimension_index] if dimension_index < len(row) else "" for row in rows]
-        series = []
-        for metric_idx in metric_indexes:
-            data = []
-            for row in rows:
-                cell = row[metric_idx] if metric_idx < len(row) else ""
-                number = self._parse_number(cell)
-                data.append(number if number is not None else 0)
-            series.append({"name": columns[metric_idx], "type": chart_type, "data": data})
-
-        chart_spec = {
-            "type": chart_type,
-            "xAxis": {"type": "category", "data": categories, "name": columns[dimension_index]},
-            "yAxis": {"type": "value"},
-            "series": series,
-            "legend": {"show": len(series) > 1},
-        }
-
-        title = "趋势图" if chart_type == "line" else "柱状图"
-        return {
-            "config": {"wide_screen_mode": True, "update_multi": True},
-            "header": {"title": {"tag": "plain_text", "content": title}},
-            "elements": [{"tag": "chart", "chart_spec": chart_spec}],
-        }
-
-    def _build_card_from_markdown_table(self, text: str) -> dict[str, Any] | None:
-        parsed = self._parse_markdown_table(text)
-        if parsed is None:
-            return None
-        columns, rows = parsed
-        dimension_indexes, metric_indexes = self._infer_table_schema(columns, rows)
-
-        # Multi-dimension: always render as table.
-        if len(dimension_indexes) > 1:
-            return self._build_table_card(columns, rows, title="多维数据表")
-
-        # No metric columns: keep table.
-        if not metric_indexes:
-            return self._build_table_card(columns, rows, title="数据表")
-
-        # Single-dimension chart selection:
-        # - time-like dimension -> line chart
-        # - otherwise -> bar chart
-        dimension_idx = dimension_indexes[0]
-        is_time_dimension = self._is_time_dimension(columns[dimension_idx])
-        chart_type = "line" if is_time_dimension else "bar"
-        return self._build_chart_card(
-            chart_type=chart_type,
-            dimension_index=dimension_idx,
-            metric_indexes=metric_indexes,
-            columns=columns,
-            rows=rows,
-        )
-
-    @staticmethod
-    def _validate_native_card(native_card: dict[str, Any]) -> None:
-        if not any(key in native_card for key in ("elements", "header", "config")):
-            raise ValueError("native_card must include at least one of: elements, header, config")
-        try:
-            json.dumps(native_card)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("native_card is not JSON serializable") from exc
 
     @staticmethod
     def _validate_feishu_card_payload(payload: dict[str, Any]) -> None:
@@ -350,141 +472,11 @@ class FeishuChannel(Channel):
         if summary is not None and not isinstance(summary, str):
             raise ValueError("feishu_card_payload.summary must be a string")
 
-        table = payload.get("table")
-        if table is not None:
-            if not isinstance(table, dict):
-                raise ValueError("feishu_card_payload.table must be an object")
-            columns = table.get("columns")
-            rows = table.get("rows")
-            if not isinstance(columns, list) or not all(isinstance(col, str) for col in columns):
-                raise ValueError("feishu_card_payload.table.columns must be string[]")
-            if not isinstance(rows, list) or not all(isinstance(row, list) for row in rows):
-                raise ValueError("feishu_card_payload.table.rows must be array of rows")
-
-        for key in ("chart_spec", "line_chart", "native_card"):
-            value = payload.get(key)
-            if value is not None and not isinstance(value, dict):
-                raise ValueError(f"feishu_card_payload.{key} must be an object")
-
-    @staticmethod
-    def _normalize_chart_series(
-        series_raw: Any,
-        *,
-        chart_type: str,
-        default_name: str = "value",
-    ) -> list[dict[str, Any]]:
-        if isinstance(series_raw, list):
-            if not series_raw:
-                return []
-            if all(isinstance(item, (int, float)) for item in series_raw):
-                return [{"name": default_name, "type": chart_type, "data": list(series_raw)}]
-            normalized: list[dict[str, Any]] = []
-            for item in series_raw:
-                if not isinstance(item, dict):
-                    continue
-                data = item.get("data")
-                if not isinstance(data, list):
-                    continue
-                normalized.append(
-                    {
-                        "name": str(item.get("name") or default_name),
-                        "type": str(item.get("type") or chart_type),
-                        "data": data,
-                    }
-                )
-            return normalized
-
-        if isinstance(series_raw, dict):
-            normalized = []
-            for key, values in series_raw.items():
-                if isinstance(values, list):
-                    normalized.append(
-                        {
-                            "name": str(key),
-                            "type": chart_type,
-                            "data": values,
-                        }
-                    )
-            return normalized
-
-        return []
-
-    @classmethod
-    def _normalize_legacy_chart_spec(cls, raw: dict[str, Any], *, default_type: str) -> dict[str, Any] | None:
-        # New format passthrough.
-        chart_spec = raw.get("chart_spec")
-        if isinstance(chart_spec, dict):
-            return chart_spec
-
-        categories = raw.get("categories")
-        if not isinstance(categories, list):
-            categories = raw.get("x")
-        if not isinstance(categories, list):
-            categories = raw.get("labels")
-        if not isinstance(categories, list):
-            categories = []
-
-        series_raw = raw.get("series")
-        if series_raw is None:
-            y_value = raw.get("y")
-            if isinstance(y_value, list) and all(isinstance(item, (int, float)) for item in y_value):
-                series_raw = [{"name": str(raw.get("name") or "value"), "data": y_value}]
-            else:
-                series_raw = y_value
-
-        chart_type = str(raw.get("type") or default_type)
-        series = cls._normalize_chart_series(
-            series_raw,
-            chart_type=chart_type,
-            default_name=str(raw.get("name") or "value"),
-        )
-        if not series:
-            return None
-
-        return {
-            "type": chart_type,
-            "xAxis": {"type": "category", "data": categories},
-            "yAxis": {"type": "value"},
-            "series": series,
-            "legend": {"show": len(series) > 1},
-        }
-
-    @classmethod
-    def _normalize_legacy_chart_payload(cls, payload: dict[str, Any]) -> dict[str, Any] | None:
-        spec = cls._normalize_legacy_chart_spec(payload, default_type="line")
-        if spec is not None:
-            return spec
-
-        line_chart = payload.get("line_chart")
-        if isinstance(line_chart, dict):
-            spec = cls._normalize_legacy_chart_spec(line_chart, default_type="line")
-            if spec is not None:
-                return spec
-
-        bar_chart = payload.get("bar_chart")
-        if isinstance(bar_chart, dict):
-            spec = cls._normalize_legacy_chart_spec(bar_chart, default_type="bar")
-            if spec is not None:
-                return spec
-
-        chart_data = payload.get("chart_data")
-        if isinstance(chart_data, dict):
-            chart_type = str(chart_data.get("type") or payload.get("chart_type") or "line")
-            spec = cls._normalize_legacy_chart_spec(chart_data, default_type=chart_type)
-            if spec is not None:
-                return spec
-
-        return None
+        chart_spec = payload.get("chart_spec")
+        if not isinstance(chart_spec, dict):
+            raise ValueError("feishu_card_payload.chart_spec must be an object")
 
     def _build_card_from_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if isinstance(payload.get("native_card"), dict):
-            self._validate_native_card(payload["native_card"])
-            card = dict(payload["native_card"])
-            card.setdefault("config", {})
-            if isinstance(card["config"], dict):
-                card["config"].setdefault("update_multi", True)
-            return card
-
         elements: list[dict[str, Any]] = []
         title = payload.get("title")
         summary = payload.get("summary")
@@ -493,37 +485,176 @@ class FeishuChannel(Channel):
         if isinstance(summary, str) and summary.strip():
             elements.append({"tag": "markdown", "content": summary.strip()})
 
-        table = payload.get("table")
-        if isinstance(table, dict):
-            columns = table.get("columns")
-            rows = table.get("rows")
-            if isinstance(columns, list) and isinstance(rows, list):
-                normalized_columns = [str(col) for col in columns]
-                normalized_rows = [
-                    [str(cell) for cell in (row if isinstance(row, list) else [row])] for row in rows
-                ]
-                markdown_table = self._build_markdown_table(normalized_columns, normalized_rows)
-                if markdown_table:
-                    # Reuse auto table->chart conversion so payload.table can render as
-                    # native card chart elements instead of raw markdown text.
-                    auto_table_card = self._build_card_from_markdown_table(markdown_table)
-                    if isinstance(auto_table_card, dict):
-                        auto_elements = auto_table_card.get("elements")
-                        if isinstance(auto_elements, list):
-                            for element in auto_elements:
-                                if not isinstance(element, dict):
-                                    continue
-                                # Avoid leaking raw markdown table in card mode.
-                                if element.get("tag") == "markdown" and "|" in str(element.get("content", "")):
-                                    continue
-                                elements.append(element)
-
-        chart_spec = self._normalize_legacy_chart_payload(payload)
+        chart_spec = payload.get("chart_spec")
         if isinstance(chart_spec, dict):
             elements.append({"tag": "chart", "chart_spec": chart_spec})
+        if not elements:
+            elements.append({"tag": "markdown", "content": " "})
+
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "elements": elements,
+        }
+
+    def _build_card_from_contract_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        elements: list[dict[str, Any]] = []
+        title = payload.get("title")
+        summary = payload.get("summary")
+        if isinstance(title, str) and title.strip():
+            elements.append({"tag": "markdown", "content": f"### {title.strip()}"})
+        if isinstance(summary, str) and summary.strip():
+            elements.append({"tag": "markdown", "content": summary.strip()})
+
+        blocks = payload.get("blocks")
+        if isinstance(blocks, list):
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                block_type = str(block.get("type") or "").strip().lower()
+                if block_type == "markdown":
+                    markdown = block.get("markdown")
+                    if isinstance(markdown, str) and markdown.strip():
+                        elements.append(
+                            {
+                                "tag": "markdown",
+                                "content": _sanitize_markdown_for_feishu_card(markdown.strip()),
+                            }
+                        )
+                    continue
+
+                if block_type == "table":
+                    table = block.get("table")
+                    if isinstance(table, dict):
+                        columns = table.get("columns")
+                        rows = table.get("rows")
+                        if isinstance(columns, list) and isinstance(rows, list):
+                            table_title = table.get("title")
+                            table_card = self._build_table_card(
+                                [str(col) for col in columns],
+                                [[str(cell) for cell in row] for row in rows if isinstance(row, list)],
+                                title=str(table_title) if isinstance(table_title, str) and table_title.strip() else "Data Table",
+                            )
+                            table_elements = table_card.get("elements")
+                            if isinstance(table_elements, list):
+                                for element in table_elements:
+                                    if isinstance(element, dict):
+                                        elements.append(element)
+                    continue
+
+                if block_type == "chart":
+                    chart = block.get("chart")
+                    if not isinstance(chart, dict):
+                        continue
+                    chart_type = str(chart.get("chart_type") or "").strip().lower()
+                    dimension = chart.get("dimension")
+                    metrics = chart.get("metrics")
+                    if not isinstance(dimension, dict) or not isinstance(metrics, list):
+                        continue
+                    dim_name = str(dimension.get("name") or "x")
+                    dim_values = dimension.get("values")
+                    if not isinstance(dim_values, list):
+                        continue
+
+                    chart_spec: dict[str, Any] | None = None
+                    if chart_type == "combo_bar_line":
+                        normalized_series: list[dict[str, Any]] = []
+                        for metric in metrics:
+                            if not isinstance(metric, dict):
+                                continue
+                            metric_name = str(metric.get("name") or "value")
+                            metric_values = metric.get("values")
+                            if not isinstance(metric_values, list):
+                                continue
+                            series_type = str(metric.get("series_type") or "bar")
+                            points = [
+                                {"x": str(dim_values[idx]), "value": metric_values[idx]}
+                                for idx in range(min(len(dim_values), len(metric_values)))
+                            ]
+                            normalized_series.append(
+                                {
+                                    "type": series_type,
+                                    "name": metric_name,
+                                    "data": {"values": points},
+                                    "xField": "x",
+                                    "yField": "value",
+                                }
+                            )
+                        if normalized_series:
+                            chart_spec = {
+                                "type": "common",
+                                "series": normalized_series,
+                                "legend": {"visible": len(normalized_series) > 1},
+                            }
+                    else:
+                        if chart_type in {"line", "bar"}:
+                            values: list[dict[str, Any]] = []
+                            for idx, x_val in enumerate(dim_values):
+                                for metric in metrics:
+                                    if not isinstance(metric, dict):
+                                        continue
+                                    metric_name = str(metric.get("name") or "value")
+                                    metric_values = metric.get("values")
+                                    if not isinstance(metric_values, list) or idx >= len(metric_values):
+                                        continue
+                                    values.append(
+                                        {
+                                            "dimension": str(x_val),
+                                            "series": metric_name,
+                                            "value": metric_values[idx],
+                                        }
+                                    )
+                            if values:
+                                chart_spec = {
+                                    "type": chart_type,
+                                    "data": {"values": values},
+                                    "xField": "dimension",
+                                    "yField": "value",
+                                    "seriesField": "series",
+                                }
+                        elif chart_type == "pie":
+                            metric = metrics[0] if metrics and isinstance(metrics[0], dict) else None
+                            metric_values = metric.get("values") if isinstance(metric, dict) else None
+                            if isinstance(metric_values, list):
+                                values = [
+                                    {"category": str(dim_values[idx]), "value": metric_values[idx]}
+                                    for idx in range(min(len(dim_values), len(metric_values)))
+                                ]
+                                if values:
+                                    chart_spec = {
+                                        "type": "pie",
+                                        "data": {"values": values},
+                                        "categoryField": "category",
+                                        "valueField": "value",
+                                    }
+                        elif chart_type == "scatter":
+                            first = metrics[0] if len(metrics) > 0 and isinstance(metrics[0], dict) else None
+                            second = metrics[1] if len(metrics) > 1 and isinstance(metrics[1], dict) else None
+                            first_values = first.get("values") if isinstance(first, dict) else None
+                            second_values = second.get("values") if isinstance(second, dict) else None
+                            if isinstance(first_values, list) and isinstance(second_values, list):
+                                count = min(len(dim_values), len(first_values), len(second_values))
+                                values = [
+                                    {
+                                        "x": first_values[idx],
+                                        "y": second_values[idx],
+                                        "dimension": str(dim_values[idx]),
+                                    }
+                                    for idx in range(count)
+                                ]
+                                if values:
+                                    chart_spec = {
+                                        "type": "scatter",
+                                        "data": {"values": values},
+                                        "xField": "x",
+                                        "yField": "y",
+                                        "seriesField": "dimension",
+                                    }
+
+                    if isinstance(chart_spec, dict):
+                        elements.append({"tag": "chart", "chart_spec": chart_spec})
 
         if not elements:
-            elements.append({"tag": "markdown", "content": payload.get("text", "") or " "})
+            elements.append({"tag": "markdown", "content": " "})
 
         return {
             "config": {"wide_screen_mode": True, "update_multi": True},
@@ -532,65 +663,109 @@ class FeishuChannel(Channel):
 
     def _resolve_card(self, msg: OutboundMessage) -> dict[str, Any]:
         metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
-        if isinstance(metadata.get("native_card"), dict):
-            return self._build_card_from_payload({"native_card": metadata["native_card"]})
+        contract = metadata.get("feishu_skill_contract")
+        if isinstance(contract, dict):
+            logger.info("[Feishu] _resolve_card: using metadata.feishu_skill_contract (%s)", _contract_summary(contract))
+            result = validate_and_normalize_contract(contract, channel_name=msg.channel_name)
+            if result.ok and result.normalized:
+                if result.normalized.get("render_mode") == "card":
+                    payload = result.normalized.get("card_payload")
+                    if isinstance(payload, dict):
+                        logger.info("[Feishu] _resolve_card: contract validated -> render contract card")
+                        return self._build_card_from_contract_payload(payload)
+                fallback_text = str(result.normalized.get("fallback_text") or msg.text)
+                logger.info("[Feishu] _resolve_card: contract validated -> fallback text card")
+                return self._build_text_card(fallback_text)
+
+            fallback_text = contract.get("fallback_text") if isinstance(contract.get("fallback_text"), str) else None
+            logger.warning("[Feishu] _resolve_card: metadata contract invalid -> fallback text card")
+            return self._build_text_card(str(fallback_text or msg.text))
+
         if isinstance(metadata.get("feishu_card_payload"), dict):
             payload = metadata["feishu_card_payload"]
             self._validate_feishu_card_payload(payload)
+            logger.info("[Feishu] _resolve_card: using metadata.feishu_card_payload")
             return self._build_card_from_payload(payload)
-        if any(isinstance(metadata.get(key), dict) for key in ("line_chart", "bar_chart", "chart_data")):
-            return self._build_card_from_payload(metadata)
 
-        auto_table_card = self._build_card_from_markdown_table(msg.text or "")
-        if auto_table_card is not None:
-            return auto_table_card
+        embedded_contract, embedded_payload = _extract_embedded_feishu_payloads(msg.text or "")
+        if isinstance(embedded_contract, dict):
+            logger.info("[Feishu] _resolve_card: extracted embedded feishu_skill_contract from text (%s)", _contract_summary(embedded_contract))
+            result = validate_and_normalize_contract(embedded_contract, channel_name=msg.channel_name)
+            if result.ok and result.normalized:
+                if result.normalized.get("render_mode") == "card":
+                    payload = result.normalized.get("card_payload")
+                    if isinstance(payload, dict):
+                        logger.info("[Feishu] _resolve_card: embedded contract validated -> render contract card")
+                        return self._build_card_from_contract_payload(payload)
+                fallback_text = str(result.normalized.get("fallback_text") or msg.text)
+                logger.info("[Feishu] _resolve_card: embedded contract validated -> fallback text card")
+                return self._build_text_card(fallback_text)
+            logger.warning("[Feishu] _resolve_card: embedded contract invalid")
 
+        if isinstance(embedded_payload, dict):
+            try:
+                self._validate_feishu_card_payload(embedded_payload)
+                logger.info("[Feishu] _resolve_card: extracted embedded feishu_card_payload from text")
+                return self._build_card_from_payload(embedded_payload)
+            except Exception:
+                logger.warning("[Feishu] embedded feishu_card_payload in text is invalid")
+
+        logger.info("[Feishu] _resolve_card: no structured payload found -> render plain text card")
         return self._build_text_card(msg.text)
 
     def _build_text_card(self, text: str) -> dict[str, Any]:
-        card: dict[str, Any] = {
+        safe_text = _sanitize_markdown_for_feishu_card(text)
+        return {
             "config": {"wide_screen_mode": True, "update_multi": True},
-            "elements": [{"tag": "markdown", "content": text}],
+            "elements": [{"tag": "markdown", "content": safe_text}],
         }
-        if self._card_style == "rich":
-            card["header"] = {
-                "title": {"tag": "plain_text", "content": "DeerFlow"},
-            }
-        return card
 
     @staticmethod
     def _build_progress_card(text: str, metadata: dict[str, Any]) -> dict[str, Any]:
         stage = metadata.get("status_stage")
         events = metadata.get("progress_events")
-        elements: list[dict[str, Any]] = []
+        timeline = metadata.get("progress_timeline")
+        elapsed = metadata.get("progress_elapsed_seconds")
+        lines: list[str] = []
 
-        if isinstance(stage, str) and stage.strip():
-            elements.append({"tag": "markdown", "content": f"**当前状态**：{stage.strip()}"})
-
-        if isinstance(events, list) and events:
-            lines: list[str] = []
+        if isinstance(timeline, list) and timeline:
+            for item in timeline[-80:]:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind") or "thought").strip().lower()
+                kind_label = "行动" if kind == "action" else "思考"
+                stage_label = str(item.get("stage") or "处理中")
+                detail = str(item.get("detail") or "").strip()
+                t = _format_elapsed_duration(item.get("elapsed_seconds"))
+                if detail:
+                    lines.append(f"[{t}] {kind_label} | {stage_label} | {detail}")
+                else:
+                    lines.append(f"[{t}] {kind_label} | {stage_label}")
+        elif isinstance(events, list) and events:
             for item in events[-8:]:
                 if not isinstance(item, dict):
                     continue
                 stage_label = str(item.get("stage") or "处理中")
                 detail = str(item.get("detail") or "").strip()
                 if detail:
-                    lines.append(f"- {stage_label} · {detail}")
+                    lines.append(f"{stage_label} | {detail}")
                 else:
-                    lines.append(f"- {stage_label}")
-            if lines:
-                elements.append({"tag": "markdown", "content": "**执行明细**\n" + "\n".join(lines)})
+                    lines.append(stage_label)
+        elif isinstance(stage, str) and stage.strip():
+            lines.append(stage.strip())
 
         if text:
-            elements.append({"tag": "markdown", "content": f"**输出片段**\n{text}"})
+            lines.append(_sanitize_markdown_for_feishu_card(text))
 
-        if not elements:
-            elements.append({"tag": "markdown", "content": text or "正在处理中..."})
+        elapsed_seconds = max(0, int(elapsed)) if isinstance(elapsed, (int, float)) else 0
+        if lines:
+            lines[-1] = f"{lines[-1]} ({elapsed_seconds}s)"
+        else:
+            lines.append(f"({elapsed_seconds}s)")
 
         return {
             "config": {"wide_screen_mode": True, "update_multi": True},
-            "header": {"title": {"tag": "plain_text", "content": "DeerFlow · 实时进展"}},
-            "elements": elements,
+            "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
         }
 
     async def start(self) -> None:
@@ -686,7 +861,24 @@ class FeishuChannel(Channel):
             # thread's uvloop.
             _ws_client_mod.loop = loop
 
-            event_handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(self._on_message).build()
+            builder = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(self._on_message)
+            menu_register_candidates = [
+                "register_p2_application_bot_menu_v6",
+                "register_p2_application_bot_menu_v4",
+                "register_p1_application_bot_menu_v6",
+                "register_p1_application_bot_menu_v4",
+            ]
+            registered_menu = False
+            for method_name in menu_register_candidates:
+                register_fn = getattr(builder, method_name, None)
+                if callable(register_fn):
+                    builder = register_fn(self._on_menu_event)
+                    registered_menu = True
+                    logger.info("[Feishu] registered menu event handler via %s", method_name)
+                    break
+            if not registered_menu:
+                logger.warning("[Feishu] bot-menu event registration not available in current lark-oapi SDK")
+            event_handler = builder.build()
             ws_client = lark.ws.Client(
                 app_id=app_id,
                 app_secret=app_secret,
@@ -715,10 +907,36 @@ class FeishuChannel(Channel):
             self._thread = None
         logger.info("Feishu channel stopped")
 
+    def get_runtime_metrics(self) -> dict[str, Any]:
+        return {
+            "script_permission_guardrail_hits": self._script_permission_guardrail_hits,
+            "contract_missing_for_chart_hits": self._contract_missing_for_chart_hits,
+        }
+
     async def send(self, msg: OutboundMessage, *, _max_retries: int = 3) -> None:
         if not self._api_client:
             logger.warning("[Feishu] send called but no api_client available")
             return
+
+        guarded_text = _apply_script_permission_guardrail(msg.text)
+        if guarded_text != msg.text:
+            self._script_permission_guardrail_hits += 1
+            logger.warning(
+                "[Feishu] script-permission guardrail hit: count=%d chat_id=%s source=%s final=%s",
+                self._script_permission_guardrail_hits,
+                msg.chat_id,
+                msg.thread_ts,
+                msg.is_final,
+            )
+        msg.text = guarded_text
+        if isinstance(msg.metadata, dict) and msg.metadata.get("feishu_contract_missing_for_chart"):
+            self._contract_missing_for_chart_hits += 1
+            logger.warning(
+                "[Feishu] chart contract missing for chart-intent request: count=%d chat_id=%s source=%s",
+                self._contract_missing_for_chart_hits,
+                msg.chat_id,
+                msg.thread_ts,
+            )
 
         logger.info(
             "[Feishu] sending reply: chat_id=%s, thread_ts=%s, text_len=%d",
@@ -830,7 +1048,13 @@ class FeishuChannel(Channel):
                 )
                 await asyncio.to_thread(self._api_client.im.v1.message.reply, request)
             else:
-                request = self._CreateMessageRequest.builder().receive_id_type("chat_id").request_body(self._CreateMessageRequestBody.builder().receive_id(msg.chat_id).msg_type(msg_type).content(content).build()).build()
+                receive_id_type = _resolve_receive_id_type(msg.chat_id)
+                request = (
+                    self._CreateMessageRequest.builder()
+                    .receive_id_type(receive_id_type)
+                    .request_body(self._CreateMessageRequestBody.builder().receive_id(msg.chat_id).msg_type(msg_type).content(content).build())
+                    .build()
+                )
                 await asyncio.to_thread(self._api_client.im.v1.message.create, request)
 
             logger.info("[Feishu] file sent: %s (type=%s)", attachment.filename, msg_type)
@@ -1024,9 +1248,10 @@ class FeishuChannel(Channel):
     async def _create_text(self, chat_id: str, text: str) -> None:
         if not self._api_client:
             return
+        receive_id_type = _resolve_receive_id_type(chat_id)
         request = (
             self._CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
+            .receive_id_type(receive_id_type)
             .request_body(
                 self._CreateMessageRequestBody.builder()
                 .receive_id(chat_id)
@@ -1068,7 +1293,13 @@ class FeishuChannel(Channel):
             return
 
         content = self._build_card_content(card)
-        request = self._CreateMessageRequest.builder().receive_id_type("chat_id").request_body(self._CreateMessageRequestBody.builder().receive_id(chat_id).msg_type("interactive").content(content).build()).build()
+        receive_id_type = _resolve_receive_id_type(chat_id)
+        request = (
+            self._CreateMessageRequest.builder()
+            .receive_id_type(receive_id_type)
+            .request_body(self._CreateMessageRequestBody.builder().receive_id(chat_id).msg_type("interactive").content(content).build())
+            .build()
+        )
         response = await asyncio.to_thread(self._api_client.im.v1.message.create, request)
         self._ensure_api_success(response, "create_card")
 
@@ -1102,7 +1333,7 @@ class FeishuChannel(Channel):
             logger.warning("[Feishu] running card creation returned no message_id for source=%s, subsequent updates will fall back to new replies", source_message_id)
         return running_card_id
 
-    def _ensure_running_card_started(self, source_message_id: str, text: str = "Working on it...") -> asyncio.Task | None:
+    def _ensure_running_card_started(self, source_message_id: str, text: str = "处理中...") -> asyncio.Task | None:
         """Start running-card creation once per source message."""
         running_card_id = self._running_card_ids.get(source_message_id)
         if running_card_id:
@@ -1122,7 +1353,7 @@ class FeishuChannel(Channel):
             self._running_card_tasks.pop(source_message_id, None)
         self._log_task_error(task, "create_running_card", source_message_id)
 
-    async def _ensure_running_card(self, source_message_id: str, text: str = "Working on it...") -> str | None:
+    async def _ensure_running_card(self, source_message_id: str, text: str = "处理中...") -> str | None:
         """Ensure the in-thread running card exists and track its message ID."""
         running_card_id = self._running_card_ids.get(source_message_id)
         if running_card_id:
@@ -1233,6 +1464,152 @@ class FeishuChannel(Channel):
             self._ensure_running_card_started(msg_id)
         await self.bus.publish_inbound(inbound)
 
+    @staticmethod
+    def _extract_menu_event_payload(event: Any) -> tuple[str | None, str | None, str | None, str | None]:
+        """Best-effort extraction for Feishu bot-menu push event payload."""
+        event_data = _safe_get(event, "event")
+        header = _safe_get(event, "header")
+        event_type = str(_safe_get(header, "event_type", "") or "")
+        if event_data is None:
+            return None, None, None, event_type or None
+
+        event_key = _first_non_empty_str(
+            _path_get(event_data, "event_key"),
+            _path_get(event_data, "key"),
+            _path_get(event_data, "action.value"),
+            _path_get(event_data, "action.name"),
+            _path_get(event_data, "option"),
+            _path_get(event, "event_key"),
+            _path_get(event, "key"),
+            _path_get(event, "action.value"),
+            _path_get(event, "action.name"),
+            event_type,
+        )
+        user_id = _first_non_empty_str(
+            _path_get(event_data, "operator.operator_id.open_id"),
+            _path_get(event_data, "operator.open_id"),
+            _path_get(event_data, "user_id.open_id"),
+            _path_get(event_data, "user.open_id"),
+            _path_get(event, "operator.operator_id.open_id"),
+            _path_get(event, "operator.open_id"),
+            _path_get(event, "user.open_id"),
+        )
+
+        open_chat_id = _first_non_empty_str(
+            _path_get(event_data, "context.open_chat_id"),
+            _path_get(event_data, "context.chat_id"),
+            _path_get(event_data, "open_chat_id"),
+            _path_get(event_data, "chat_id"),
+            _path_get(event_data, "message.chat_id"),
+            _path_get(event_data, "action.context.open_chat_id"),
+            _path_get(event_data, "action.context.chat_id"),
+            _path_get(event, "event.context.open_chat_id"),
+            _path_get(event, "event.context.chat_id"),
+            _path_get(event, "event.open_chat_id"),
+            _path_get(event, "event.chat_id"),
+            _path_get(event, "event.message.chat_id"),
+        )
+        open_message_id = _first_non_empty_str(
+            _path_get(event_data, "context.open_message_id"),
+            _path_get(event_data, "context.message_id"),
+            _path_get(event_data, "open_message_id"),
+            _path_get(event_data, "message_id"),
+            _path_get(event_data, "message.message_id"),
+            _path_get(event_data, "action.context.open_message_id"),
+            _path_get(event_data, "action.context.message_id"),
+            _path_get(event, "event.context.open_message_id"),
+            _path_get(event, "event.context.message_id"),
+            _path_get(event, "event.open_message_id"),
+            _path_get(event, "event.message_id"),
+            _path_get(event, "event.message.message_id"),
+        )
+        return open_chat_id or None, open_message_id or None, user_id or None, event_key or event_type or None
+
+    def _on_menu_event(self, event) -> None:
+        """Called by lark-oapi when a bot custom-menu event is pushed."""
+        try:
+            chat_id, message_id, user_id, event_key = self._extract_menu_event_payload(event)
+            # Keep delivery target and conversation key separate:
+            # - delivery target can be open_id (for immediate feedback),
+            # - conversation key must remain chat/topic scoped to avoid cross-chat session/thread pollution.
+            reply_target_id = chat_id or user_id
+
+            if not chat_id and user_id:
+                fallback_chat = self._user_last_chat_id.get(user_id)
+                if fallback_chat:
+                    chat_id = fallback_chat
+                    logger.info(
+                        "[Feishu] menu event resolved chat_id from user cache: user_id=%s chat_id=%s event_key=%s",
+                        user_id,
+                        chat_id,
+                        event_key,
+                    )
+                else:
+                    logger.info("[Feishu] menu event has no chat_id and no cache hit: user_id=%s event_key=%s", user_id, event_key)
+            if not chat_id or not event_key:
+                logger.warning(
+                    "[Feishu] menu event missing chat_id/event_key, ignored: parsed_chat_id=%r parsed_event_key=%r payload=%s",
+                    chat_id,
+                    event_key,
+                    json.dumps(_sanitize_for_log(event), ensure_ascii=False, default=str),
+                )
+                # If we only have user identity (open_id), send a direct hint instead of silently dropping.
+                # Do NOT route command with open_id as conversation key; that would break per-chat thread/session semantics.
+                if event_key and reply_target_id and self._main_loop and self._main_loop.is_running():
+                    hint = (
+                        f"已收到菜单操作：{event_key}\n"
+                        "当前事件缺少会话ID，无法绑定到群会话上下文。"
+                        "请先在目标会话发送一条消息后再点击菜单。"
+                    )
+                    reply = OutboundMessage(
+                        channel_name="feishu",
+                        chat_id=reply_target_id,
+                        thread_id="",
+                        text=hint,
+                        thread_ts=message_id,
+                    )
+                    fut = asyncio.run_coroutine_threadsafe(self.bus.publish_outbound(reply), self._main_loop)
+                    fut.add_done_callback(lambda f, mid=message_id or f"menu:{reply_target_id}": self._log_future_error(f, "publish_menu_hint", mid))
+                return
+
+            mapped_command = self._menu_event_key_to_command.get(event_key.strip().lower())
+            if not mapped_command:
+                logger.warning("[Feishu] unknown menu event key: %s", event_key)
+                if self._main_loop and self._main_loop.is_running():
+                    reply = OutboundMessage(
+                        channel_name="feishu",
+                        chat_id=reply_target_id or chat_id,
+                        thread_id="",
+                        text=f"Unsupported menu event: {event_key}",
+                        thread_ts=message_id,
+                    )
+                    target = reply_target_id or chat_id or "menu"
+                    fut = asyncio.run_coroutine_threadsafe(self.bus.publish_outbound(reply), self._main_loop)
+                    fut.add_done_callback(lambda f, mid=message_id or f"menu:{target}": self._log_future_error(f, "publish_menu_unknown", mid))
+                return
+
+            inbound = self._make_inbound(
+                chat_id=chat_id,
+                user_id=user_id or "",
+                text=mapped_command,
+                msg_type=InboundMessageType.COMMAND,
+                thread_ts=message_id,
+                metadata={
+                    "source": "feishu_menu",
+                    "event_key": event_key,
+                    "render_mode": self._render_mode,
+                },
+            )
+            inbound.topic_id = message_id or chat_id
+            if self._main_loop and self._main_loop.is_running():
+                source_id = message_id or f"menu:{chat_id}"
+                fut = asyncio.run_coroutine_threadsafe(self._prepare_inbound(source_id, inbound), self._main_loop)
+                fut.add_done_callback(lambda f, mid=source_id: self._log_future_error(f, "prepare_inbound(menu)", mid))
+            else:
+                logger.warning("[Feishu] main loop not running, cannot publish menu event")
+        except Exception:
+            logger.exception("[Feishu] error processing menu event")
+
     def _on_message(self, event) -> None:
         """Called by lark-oapi when a message is received (runs in lark thread)."""
         try:
@@ -1241,6 +1618,8 @@ class FeishuChannel(Channel):
             chat_id = message.chat_id
             msg_id = message.message_id
             sender_id = event.event.sender.sender_id.open_id
+            if isinstance(sender_id, str) and sender_id and isinstance(chat_id, str) and chat_id:
+                self._user_last_chat_id[sender_id] = chat_id
 
             # root_id is set when the message is a reply within a Feishu thread.
             # Use it as topic_id so all replies share the same DeerFlow thread.
@@ -1248,6 +1627,9 @@ class FeishuChannel(Channel):
 
             # Parse message content
             content = json.loads(message.content)
+            is_group_message = self._is_group_message(message)
+            mentions = self._extract_at_mentions(content, message)
+            bot_mentioned = self._is_bot_mentioned(mentions)
 
             # files_list store the any-file-key in feishu messages, which can be used to download the file content later
             # In Feishu channel, image_keys are independent of file_keys.
@@ -1305,11 +1687,13 @@ class FeishuChannel(Channel):
             text = text.strip()
 
             logger.info(
-                "[Feishu] parsed message: chat_id=%s, msg_id=%s, root_id=%s, sender=%s, text=%r",
+                "[Feishu] parsed message: chat_id=%s, msg_id=%s, root_id=%s, sender=%s, group=%s, mentioned=%s, text=%r",
                 chat_id,
                 msg_id,
                 root_id,
                 sender_id,
+                is_group_message,
+                bot_mentioned,
                 text[:100] if text else "",
             )
 
@@ -1323,6 +1707,16 @@ class FeishuChannel(Channel):
                 msg_type = InboundMessageType.COMMAND
             else:
                 msg_type = InboundMessageType.CHAT
+
+            if self._require_mention_in_group and is_group_message and not bot_mentioned and msg_type != InboundMessageType.COMMAND:
+                logger.info("[Feishu] group message without bot mention, ignoring: chat_id=%s, msg_id=%s", chat_id, msg_id)
+                return
+
+            if is_group_message and bot_mentioned:
+                text = self._strip_bot_mentions(text, mentions)
+                if not (text or files_list):
+                    logger.info("[Feishu] group message only mentioned bot, ignoring: chat_id=%s, msg_id=%s", chat_id, msg_id)
+                    return
 
             topic_id = self._resolve_topic_id(chat_id=chat_id, msg_id=msg_id, root_id=root_id)
 
@@ -1340,6 +1734,8 @@ class FeishuChannel(Channel):
                     "reply_in_thread": self._reply_in_thread,
                     "card_style": self._card_style,
                     "render_mode": self._render_mode,
+                    "is_group_message": is_group_message,
+                    "bot_mentioned": bot_mentioned,
                 },
             )
             inbound.topic_id = topic_id
@@ -1353,4 +1749,3 @@ class FeishuChannel(Channel):
                 logger.warning("[Feishu] main loop not running, cannot publish inbound message")
         except Exception:
             logger.exception("[Feishu] error processing message")
-

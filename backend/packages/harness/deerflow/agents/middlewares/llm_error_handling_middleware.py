@@ -61,6 +61,11 @@ _AUTH_PATTERNS = (
     "无权",
     "未授权",
 )
+_EVENT_LOOP_PATTERNS = (
+    "event loop is closed",
+    "cannot schedule new futures after shutdown",
+    "attached to a different loop",
+)
 
 
 class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
@@ -154,6 +159,8 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             return False, "quota"
         if _matches_any(lowered, _AUTH_PATTERNS):
             return False, "auth"
+        if _matches_any(lowered, _EVENT_LOOP_PATTERNS):
+            return True, "transient"
 
         exc_name = exc.__class__.__name__
         if exc_name in {

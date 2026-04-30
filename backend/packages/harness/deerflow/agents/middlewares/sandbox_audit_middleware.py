@@ -60,6 +60,13 @@ _MEDIUM_RISK_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bPATH\s*="),
 ]
 
+_FEISHU_CHART_HARD_BLOCK_PATTERNS: list[re.Pattern[str]] = [
+    # Block installing canvas dependency in Feishu chart flow.
+    re.compile(r"\bnpm\s+install\b.*\bcanvas\b"),
+    # Block ad-hoc script-based chart generation in Feishu flow.
+    re.compile(r"\b(node|python3?|bash)\b.*(chart|plot|graph|trend)"),
+]
+
 
 def _split_compound_command(command: str) -> list[str]:
     """Split a compound command into sub-commands (quote-aware).
@@ -189,6 +196,21 @@ def _classify_command(command: str) -> str:
     return worst
 
 
+def _classify_command_for_channel(command: str, channel_name: str | None) -> str:
+    """Channel-aware wrapper around generic command classification."""
+    verdict = _classify_command(command)
+    if verdict == "block":
+        return verdict
+
+    normalized_channel = (channel_name or "").strip().lower()
+    if normalized_channel == "feishu":
+        normalized = " ".join(command.split()).lower()
+        for pattern in _FEISHU_CHART_HARD_BLOCK_PATTERNS:
+            if pattern.search(normalized):
+                return "block"
+    return verdict
+
+
 # ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
@@ -228,6 +250,17 @@ class SandboxAuditMiddleware(AgentMiddleware[ThreadState]):
             thread_id = cfg.get("configurable", {}).get("thread_id")
         return thread_id
 
+    def _get_channel_name(self, request: ToolCallRequest) -> str | None:
+        runtime = request.runtime
+        if runtime is None:
+            return None
+        ctx = getattr(runtime, "context", None) or {}
+        if isinstance(ctx, dict):
+            raw = ctx.get("channel_name")
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip().lower()
+        return None
+
     _AUDIT_COMMAND_LIMIT = 200
 
     def _write_audit(self, thread_id: str | None, command: str, verdict: str, *, truncate: bool = False) -> None:
@@ -242,10 +275,21 @@ class SandboxAuditMiddleware(AgentMiddleware[ThreadState]):
         }
         logger.info("[SandboxAudit] %s", json.dumps(record, ensure_ascii=False))
 
-    def _build_block_message(self, request: ToolCallRequest, reason: str) -> ToolMessage:
+    def _build_block_message(self, request: ToolCallRequest, reason: str, *, channel_name: str | None = None) -> ToolMessage:
         tool_call_id = str(request.tool_call.get("id") or "missing_id")
+        normalized_channel = (channel_name or "").strip().lower()
+        if normalized_channel == "feishu":
+            content = (
+                "Command blocked: security violation detected in Feishu channel chart flow. "
+                "Do NOT ask the user for script/bash/node execution permission. "
+                "Generate chart output directly using Feishu contract/card payload instead: "
+                "`metadata.feishu_skill_contract` (preferred) or `metadata.feishu_card_payload.chart_spec` "
+                "with text fallback."
+            )
+        else:
+            content = f"Command blocked: {reason}. Please use a safer alternative approach."
         return ToolMessage(
-            content=f"Command blocked: {reason}. Please use a safer alternative approach.",
+            content=content,
             tool_call_id=tool_call_id,
             name="bash",
             status="error",
@@ -309,8 +353,9 @@ class SandboxAuditMiddleware(AgentMiddleware[ThreadState]):
             logger.warning("[SandboxAudit] INVALID INPUT thread=%s reason=%s", thread_id, reject_reason)
             return command, thread_id, "block", reject_reason
 
-        # ② classify command
-        verdict = _classify_command(command)
+        # ② classify command (with channel-aware hard guards)
+        channel_name = self._get_channel_name(request)
+        verdict = _classify_command_for_channel(command, channel_name)
 
         # ③ audit log
         self._write_audit(thread_id, command, verdict)
@@ -338,7 +383,8 @@ class SandboxAuditMiddleware(AgentMiddleware[ThreadState]):
         command, _, verdict, reject_reason = self._pre_process(request)
         if verdict == "block":
             reason = reject_reason or "security violation detected"
-            return self._build_block_message(request, reason)
+            channel_name = self._get_channel_name(request)
+            return self._build_block_message(request, reason, channel_name=channel_name)
         result = handler(request)
         if verdict == "warn":
             result = self._append_warn_to_result(result, command)
@@ -356,7 +402,8 @@ class SandboxAuditMiddleware(AgentMiddleware[ThreadState]):
         command, _, verdict, reject_reason = self._pre_process(request)
         if verdict == "block":
             reason = reject_reason or "security violation detected"
-            return self._build_block_message(request, reason)
+            channel_name = self._get_channel_name(request)
+            return self._build_block_message(request, reason, channel_name=channel_name)
         result = await handler(request)
         if verdict == "warn":
             result = self._append_warn_to_result(result, command)
