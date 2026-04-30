@@ -725,13 +725,6 @@ def apply_prompt_template(
     agent_name: str | None = None,
     available_skills: set[str] | None = None,
     channel_name: str | None = None,
-) -> str:
-def apply_prompt_template(
-    subagent_enabled: bool = False,
-    max_concurrent_subagents: int = 3,
-    *,
-    agent_name: str | None = None,
-    available_skills: set[str] | None = None,
     app_config: AppConfig | None = None,
 ) -> str:
     # Get memory context

@@ -150,6 +150,7 @@ def _is_thread_or_assistant_not_found_error(exc: BaseException | None) -> bool:
     not_found_hint = (
         "thread or assistant not found" in text
         or "thread not found" in text
+        or re.search(r"\bthread\s+[\w-]+\s+not\s+found\b", text) is not None
         or "assistant not found" in text
     )
     if not not_found_hint:
@@ -1304,7 +1305,7 @@ class ChannelManager:
 
         response_text = _extract_response_text(result)
         artifacts = _extract_artifacts(result)
-        outbound_metadata: dict[str, Any] = {}
+        outbound_metadata: dict[str, Any] = _slim_metadata(msg.metadata)
         feishu_chart_contract_missing = False
         if msg.channel_name == "feishu":
             chart_requested = _looks_like_chart_request(msg.text)

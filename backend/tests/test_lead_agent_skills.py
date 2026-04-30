@@ -160,3 +160,13 @@ def test_make_lead_agent_empty_skills_passed_correctly(monkeypatch):
     monkeypatch.setattr(lead_agent_module, "load_agent_config", lambda x: AgentConfig(name="test", skills=["skill1"]))
     lead_agent_module.make_lead_agent({"configurable": {"agent_name": "test"}})
     assert captured_skills[-1] == {"skill1"}
+
+    # Case 4: Feishu channel should force inject feishu-chart-contract
+    monkeypatch.setattr(lead_agent_module, "load_agent_config", lambda x: AgentConfig(name="test", skills=["skill1"]))
+    lead_agent_module.make_lead_agent({"configurable": {"agent_name": "test", "channel_name": "feishu"}})
+    assert captured_skills[-1] == {"skill1", "feishu-chart-contract"}
+
+    # Case 5: Feishu channel + None skills should still inject feishu skill
+    monkeypatch.setattr(lead_agent_module, "load_agent_config", lambda x: AgentConfig(name="test", skills=None))
+    lead_agent_module.make_lead_agent({"configurable": {"agent_name": "test", "channel_name": "feishu"}})
+    assert captured_skills[-1] == {"feishu-chart-contract"}

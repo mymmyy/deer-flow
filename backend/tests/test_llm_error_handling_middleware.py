@@ -334,6 +334,14 @@ def test_classify_error_remote_protocol_error_is_retriable() -> None:
     assert reason == "transient"
 
 
+def test_classify_error_event_loop_closed_is_retriable() -> None:
+    middleware = _build_middleware()
+    exc = RuntimeError("Event loop is closed")
+    retriable, reason = middleware._classify_error(exc)
+    assert retriable is True
+    assert reason == "transient"
+
+
 def test_sync_read_error_triggers_retry_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     middleware = _build_middleware(retry_max_attempts=3, retry_base_delay_ms=10, retry_cap_delay_ms=10)
     attempts = 0

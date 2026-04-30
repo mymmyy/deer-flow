@@ -192,14 +192,152 @@ def test_feishu_treats_unknown_slash_text_as_chat(text):
         assert mock_make_inbound.call_args[1]["msg_type"].value == "chat", f"{text!r} should be classified as CHAT"
 
 
-def _build_text_event(*, chat_id: str = "chat_1", msg_id: str = "msg_1", root_id: str | None = None, text: str = "hi"):
+def _build_text_event(
+    *,
+    chat_id: str = "chat_1",
+    msg_id: str = "msg_1",
+    root_id: str | None = None,
+    text: str = "hi",
+    chat_type: str = "p2p",
+):
     event = MagicMock()
     event.event.message.chat_id = chat_id
     event.event.message.message_id = msg_id
     event.event.message.root_id = root_id
+    event.event.message.chat_type = chat_type
     event.event.sender.sender_id.open_id = "user_1"
     event.event.message.content = json.dumps({"text": text})
     return event
+
+
+def _build_rich_text_event(
+    *,
+    chat_id: str = "chat_1",
+    msg_id: str = "msg_1",
+    root_id: str | None = None,
+    content: dict,
+    chat_type: str = "p2p",
+):
+    event = MagicMock()
+    event.event.message.chat_id = chat_id
+    event.event.message.message_id = msg_id
+    event.event.message.root_id = root_id
+    event.event.message.chat_type = chat_type
+    event.event.sender.sender_id.open_id = "user_1"
+    event.event.message.content = json.dumps(content)
+    return event
+
+
+def test_feishu_group_message_without_mention_is_ignored():
+    bus = MessageBus()
+    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test", "require_mention_in_group": True})
+    event = _build_text_event(text="normal team chatter", chat_type="group")
+
+    with pytest.MonkeyPatch.context() as m:
+        mock_make_inbound = MagicMock()
+        m.setattr(channel, "_make_inbound", mock_make_inbound)
+        channel._on_message(event)
+
+        mock_make_inbound.assert_not_called()
+
+
+def test_feishu_group_message_with_bot_mention_is_accepted_and_cleaned():
+    bus = MessageBus()
+    channel = FeishuChannel(
+        bus,
+        {
+            "app_id": "test",
+            "app_secret": "test",
+            "require_mention_in_group": True,
+            "bot_open_id": "ou_bot",
+        },
+    )
+    event = _build_rich_text_event(
+        chat_type="group",
+        content={
+            "content": [
+                [
+                    {"tag": "at", "user_id": "ou_bot", "text": "@DeerFlow"},
+                    {"tag": "text", "text": " please summarize this"},
+                ]
+            ]
+        },
+    )
+
+    with pytest.MonkeyPatch.context() as m:
+        mock_make_inbound = MagicMock()
+        m.setattr(channel, "_make_inbound", mock_make_inbound)
+        channel._on_message(event)
+
+        mock_make_inbound.assert_called_once()
+        assert mock_make_inbound.call_args[1]["text"] == "please summarize this"
+        assert mock_make_inbound.call_args[1]["metadata"]["is_group_message"] is True
+        assert mock_make_inbound.call_args[1]["metadata"]["bot_mentioned"] is True
+
+
+def test_feishu_group_mention_requires_configured_bot_identity():
+    bus = MessageBus()
+    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test", "require_mention_in_group": True})
+    event = _build_rich_text_event(
+        chat_type="group",
+        content={
+            "content": [
+                [
+                    {"tag": "at", "user_id": "ou_someone_else", "text": "@Someone"},
+                    {"tag": "text", "text": " this should not wake the bot"},
+                ]
+            ]
+        },
+    )
+
+    with pytest.MonkeyPatch.context() as m:
+        mock_make_inbound = MagicMock()
+        m.setattr(channel, "_make_inbound", mock_make_inbound)
+        channel._on_message(event)
+
+        mock_make_inbound.assert_not_called()
+
+
+def test_feishu_group_plain_text_placeholder_mention_is_accepted_and_cleaned():
+    bus = MessageBus()
+    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test", "require_mention_in_group": True})
+    event = _build_text_event(text="@_user_1 please summarize this", chat_type="group")
+
+    with pytest.MonkeyPatch.context() as m:
+        mock_make_inbound = MagicMock()
+        m.setattr(channel, "_make_inbound", mock_make_inbound)
+        channel._on_message(event)
+
+        mock_make_inbound.assert_called_once()
+        assert mock_make_inbound.call_args[1]["text"] == "please summarize this"
+
+
+def test_feishu_group_known_command_without_mention_is_accepted():
+    bus = MessageBus()
+    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test", "require_mention_in_group": True})
+    command = sorted(KNOWN_CHANNEL_COMMANDS)[0]
+    event = _build_text_event(text=command, chat_type="group")
+
+    with pytest.MonkeyPatch.context() as m:
+        mock_make_inbound = MagicMock()
+        m.setattr(channel, "_make_inbound", mock_make_inbound)
+        channel._on_message(event)
+
+        mock_make_inbound.assert_called_once()
+        assert mock_make_inbound.call_args[1]["msg_type"].value == "command"
+
+
+def test_feishu_private_message_without_mention_is_accepted():
+    bus = MessageBus()
+    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test", "require_mention_in_group": True})
+    event = _build_text_event(text="hello", chat_type="p2p")
+
+    with pytest.MonkeyPatch.context() as m:
+        mock_make_inbound = MagicMock()
+        m.setattr(channel, "_make_inbound", mock_make_inbound)
+        channel._on_message(event)
+
+        mock_make_inbound.assert_called_once()
 
 
 def test_feishu_context_boundary_chat_uses_chat_id_as_topic():
@@ -350,7 +488,7 @@ def test_feishu_render_mode_auto_prefers_text_for_plain_response():
     assert channel._resolve_render_mode_for_message(outbound) == "text"
 
 
-def test_feishu_render_mode_auto_prefers_card_for_table_like_response():
+def test_feishu_render_mode_auto_prefers_text_for_table_like_response_without_explicit_payload():
     bus = MessageBus()
     channel = FeishuChannel(
         bus,
@@ -359,12 +497,12 @@ def test_feishu_render_mode_auto_prefers_card_for_table_like_response():
     outbound = MagicMock()
     outbound.thread_ts = "msg_table"
     outbound.metadata = {}
-    outbound.text = "| 日期 | 花费 |\n| --- | --- |\n| 2026-04-20 | 100 |"
+    outbound.text = "| 鏃ユ湡 | 鑺辫垂 |\n| --- | --- |\n| 2026-04-20 | 100 |"
 
-    assert channel._resolve_render_mode_for_message(outbound) == "card"
+    assert channel._resolve_render_mode_for_message(outbound) == "text"
 
 
-def test_feishu_render_mode_auto_prefers_card_for_structured_payload():
+def test_feishu_render_mode_auto_prefers_card_for_explicit_chart_spec_payload():
     bus = MessageBus()
     channel = FeishuChannel(
         bus,
@@ -372,7 +510,7 @@ def test_feishu_render_mode_auto_prefers_card_for_structured_payload():
     )
     outbound = MagicMock()
     outbound.thread_ts = "msg_payload"
-    outbound.metadata = {"feishu_card_payload": {"title": "日报"}}
+    outbound.metadata = {"feishu_card_payload": {"title": "鏃ユ姤", "chart_spec": {"type": "line", "series": []}}}
     outbound.text = "summary"
 
     assert channel._resolve_render_mode_for_message(outbound) == "card"
@@ -396,22 +534,35 @@ def test_feishu_rejects_invalid_feishu_card_payload_schema():
     bus = MessageBus()
     channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
     outbound = MagicMock()
-    outbound.metadata = {"feishu_card_payload": {"table": {"columns": ["日期"], "rows": "not-a-list"}}}
+    outbound.metadata = {"feishu_card_payload": {"title": "invalid"}}
     outbound.text = "x"
 
-    with pytest.raises(ValueError, match="rows must be array of rows"):
+    with pytest.raises(ValueError, match="chart_spec must be an object"):
         channel._resolve_card(outbound)
 
 
-def test_feishu_rejects_invalid_native_card_schema():
+def test_feishu_resolves_explicit_chart_spec_payload():
     bus = MessageBus()
     channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
     outbound = MagicMock()
-    outbound.metadata = {"native_card": {"foo": "bar"}}
+    outbound.metadata = {
+        "feishu_card_payload": {
+            "title": "trend",
+            "summary": "daily spend",
+            "chart_spec": {
+                "type": "line",
+                "xAxis": {"type": "category", "data": ["2026-04-20", "2026-04-21"]},
+                "yAxis": {"type": "value"},
+                "series": [{"name": "spend", "type": "line", "data": [100, 120]}],
+            },
+        }
+    }
     outbound.text = "x"
 
-    with pytest.raises(ValueError, match="native_card must include"):
-        channel._resolve_card(outbound)
+    card = channel._resolve_card(outbound)
+    chart_elements = [el for el in card["elements"] if el.get("tag") == "chart"]
+    assert chart_elements
+    assert chart_elements[0]["chart_spec"]["type"] == "line"
 
 
 def test_feishu_send_falls_back_to_text_when_card_delivery_fails():
@@ -545,18 +696,23 @@ def test_feishu_build_progress_card_contains_status_and_events():
         {
             "status_stage": "调用工具中",
             "progress_events": [
-                {"stage": "解析需求", "detail": "识别用户问题"},
-                {"stage": "调用工具中", "detail": "web_search(q=花费趋势)"},
+                {"stage": "解析需求", "detail": "识别用户意图"},
+                {"stage": "调用工具中", "detail": "web_search(q=spend trend)"},
             ],
+            "progress_timeline": [
+                {"kind": "thought", "stage": "解析需求", "detail": "规划执行路径", "elapsed_seconds": 1},
+                {"kind": "action", "stage": "调用工具中", "detail": "web_search(q=spend trend)", "elapsed_seconds": 3},
+            ],
+            "progress_elapsed_seconds": 3,
+            "progress_timer_running": True,
         },
     )
 
-    assert card["header"]["title"]["content"].startswith("DeerFlow")
     markdown_blocks = [el["content"] for el in card["elements"] if el.get("tag") == "markdown"]
     merged = "\n".join(markdown_blocks)
-    assert "当前状态" in merged
-    assert "执行明细" in merged
+    assert "[00:03] 行动 | 调用工具中 | web_search(q=spend trend)" in merged
     assert "web_search" in merged
+    assert "partial output (3s)" in merged
 
 
 def test_feishu_send_card_message_non_final_uses_progress_card_when_metadata_present():
@@ -582,147 +738,108 @@ def test_feishu_send_card_message_non_final_uses_progress_card_when_metadata_pre
         called_card = channel._update_card.await_args.args[1]
         markdown_blocks = [el["content"] for el in called_card["elements"] if el.get("tag") == "markdown"]
         merged = "\n".join(markdown_blocks)
-        assert "当前状态" in merged
-        assert "执行明细" in merged
+        assert "调用工具中" in merged
         assert "read_file" in merged
+        assert "partial (0s)" in merged
 
     _run(go())
 
 
-def test_feishu_markdown_table_multi_dimension_renders_table_card():
+def test_feishu_resolves_skill_contract_chart_block_to_chart_element():
     bus = MessageBus()
     channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
     outbound = MagicMock()
-    outbound.metadata = {}
-    outbound.text = (
-        "| 日期 | 渠道 | 花费 |\n"
-        "| --- | --- | --- |\n"
-        "| 2026-04-20 | 抖音 | 100 |\n"
-        "| 2026-04-20 | 快手 | 80 |"
-    )
-
-    card = channel._resolve_card(outbound)
-    assert card["elements"][0]["tag"] == "markdown"
-    assert "多维数据表" in card["header"]["title"]["content"]
-
-
-def test_feishu_markdown_table_single_dimension_time_uses_line_chart():
-    bus = MessageBus()
-    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
-    outbound = MagicMock()
-    outbound.metadata = {}
-    outbound.text = (
-        "| 日期 | 花费 |\n"
-        "| --- | --- |\n"
-        "| 2026-04-20 | 100 |\n"
-        "| 2026-04-21 | 120 |"
-    )
-
-    card = channel._resolve_card(outbound)
-    assert card["elements"][0]["tag"] == "chart"
-    spec = card["elements"][0]["chart_spec"]
-    assert spec["type"] == "line"
-    assert spec["series"][0]["name"] == "花费"
-
-
-def test_feishu_markdown_table_single_dimension_non_time_uses_bar_chart():
-    bus = MessageBus()
-    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
-    outbound = MagicMock()
-    outbound.metadata = {}
-    outbound.text = (
-        "| 渠道 | 花费 |\n"
-        "| --- | --- |\n"
-        "| 抖音 | 100 |\n"
-        "| 快手 | 80 |"
-    )
-
-    card = channel._resolve_card(outbound)
-    assert card["elements"][0]["tag"] == "chart"
-    spec = card["elements"][0]["chart_spec"]
-    assert spec["type"] == "bar"
-    assert spec["xAxis"]["name"] == "渠道"
-
-
-def test_feishu_markdown_table_single_dimension_multi_metric_keeps_multi_series():
-    bus = MessageBus()
-    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
-    outbound = MagicMock()
-    outbound.metadata = {}
-    outbound.text = (
-        "| 日期 | 花费 | 点击 |\n"
-        "| --- | --- | --- |\n"
-        "| 2026-04-20 | 100 | 20 |\n"
-        "| 2026-04-21 | 120 | 25 |"
-    )
-
-    card = channel._resolve_card(outbound)
-    assert card["elements"][0]["tag"] == "chart"
-    spec = card["elements"][0]["chart_spec"]
-    assert len(spec["series"]) == 2
-    assert spec["series"][0]["type"] == "line"
-
-
-def test_feishu_legacy_line_chart_payload_normalizes_to_chart_spec():
-    bus = MessageBus()
-    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
-    outbound = MagicMock()
+    outbound.channel_name = "feishu"
     outbound.metadata = {
-        "feishu_card_payload": {
-            "title": "趋势",
-            "line_chart": {
-                "x": ["2026-04-20", "2026-04-21"],
-                "y": [100, 120],
-                "name": "花费",
+        "feishu_skill_contract": {
+            "card_schema_version": "v1",
+            "target_channel": "feishu",
+            "render_mode": "card",
+            "fallback_text": "fallback",
+            "card_payload": {
+                "title": "report",
+                "blocks": [
+                    {
+                        "type": "chart",
+                        "chart": {
+                            "chart_type": "line",
+                            "dimension": {"name": "date", "values": ["2026-04-20", "2026-04-21"]},
+                            "metrics": [{"name": "spend", "values": [100, 120]}],
+                        },
+                    }
+                ],
             },
         }
     }
-    outbound.text = "x"
+    outbound.text = "fallback"
 
     card = channel._resolve_card(outbound)
     chart_elements = [el for el in card["elements"] if el.get("tag") == "chart"]
     assert chart_elements
-    spec = chart_elements[0]["chart_spec"]
-    assert spec["type"] == "line"
-    assert spec["series"][0]["name"] == "花费"
-    assert spec["series"][0]["data"] == [100, 120]
+    assert chart_elements[0]["chart_spec"]["type"] == "line"
+    assert isinstance(chart_elements[0]["chart_spec"].get("data"), dict)
+    assert isinstance(chart_elements[0]["chart_spec"]["data"].get("values"), list)
+    assert chart_elements[0]["chart_spec"].get("xField") == "dimension"
+    assert chart_elements[0]["chart_spec"].get("yField") == "value"
 
 
-def test_feishu_legacy_bar_chart_payload_normalizes_to_chart_spec():
+def test_feishu_render_mode_auto_upgrades_text_cache_to_card_when_contract_arrives():
+    bus = MessageBus()
+    channel = FeishuChannel(
+        bus,
+        {"app_id": "test", "app_secret": "test", "render_mode": "auto"},
+    )
+
+    # Simulate streaming: first chunk has plain text and gets cached as text mode.
+    chunk = MagicMock()
+    chunk.thread_ts = "msg_upgrade"
+    chunk.metadata = {}
+    chunk.text = "processing..."
+    assert channel._resolve_render_mode_for_message(chunk) == "text"
+
+    # Final chunk carries explicit Feishu skill contract and should upgrade to card.
+    final_msg = MagicMock()
+    final_msg.thread_ts = "msg_upgrade"
+    final_msg.metadata = {
+        "feishu_skill_contract": {
+            "card_schema_version": "v1",
+            "target_channel": "feishu",
+            "render_mode": "card",
+            "fallback_text": "fallback",
+            "card_payload": {
+                "blocks": [
+                    {
+                        "type": "chart",
+                        "chart": {
+                            "chart_type": "line",
+                            "dimension": {"name": "date", "values": ["2026-04-20", "2026-04-21"]},
+                            "metrics": [{"name": "spend", "values": [100, 120]}],
+                        },
+                    }
+                ]
+            },
+        }
+    }
+    final_msg.text = "done"
+
+    assert channel._resolve_render_mode_for_message(final_msg) == "card"
+
+
+def test_feishu_resolves_embedded_metadata_contract_json_text_to_chart_card():
     bus = MessageBus()
     channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
     outbound = MagicMock()
-    outbound.metadata = {
-        "bar_chart": {
-            "categories": ["抖音", "快手"],
-            "series": [{"name": "花费", "data": [100, 80]}],
-        }
-    }
-    outbound.text = "x"
+    outbound.channel_name = "feishu"
+    outbound.metadata = {}
+    outbound.text = (
+        '{"metadata":{"feishu_skill_contract":{"card_schema_version":"v1","target_channel":"feishu",'
+        '"render_mode":"card","fallback_text":"fallback","card_payload":{"title":"trend","blocks":[{"type":"chart",'
+        '"chart":{"chart_type":"line","dimension":{"name":"date","values":["04-21","04-22"]},'
+        '"metrics":[{"name":"spend","values":[100,120]}]}}]}}}}'
+    )
 
     card = channel._resolve_card(outbound)
-    assert card["elements"][0]["tag"] == "chart"
-    spec = card["elements"][0]["chart_spec"]
-    assert spec["type"] == "bar"
-    assert spec["xAxis"]["data"] == ["抖音", "快手"]
-
-
-def test_feishu_legacy_chart_data_payload_normalizes_to_chart_spec():
-    bus = MessageBus()
-    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
-    outbound = MagicMock()
-    outbound.metadata = {
-        "chart_data": {
-            "type": "line",
-            "labels": ["Mon", "Tue"],
-            "series": {"点击": [10, 20]},
-        }
-    }
-    outbound.text = "x"
-
-    card = channel._resolve_card(outbound)
-    assert card["elements"][0]["tag"] == "chart"
-    spec = card["elements"][0]["chart_spec"]
-    assert spec["type"] == "line"
-    assert spec["series"][0]["name"] == "点击"
-    assert spec["series"][0]["data"] == [10, 20]
+    chart_elements = [el for el in card["elements"] if el.get("tag") == "chart"]
+    assert chart_elements
+    assert chart_elements[0]["chart_spec"]["type"] == "line"
+    assert isinstance(chart_elements[0]["chart_spec"].get("data"), dict)

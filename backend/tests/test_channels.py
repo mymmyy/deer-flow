@@ -25,6 +25,18 @@ def _run(coro):
         loop.close()
 
 
+def test_append_runtime_footer_separates_body_with_blank_line():
+    from app.channels.manager import _append_runtime_footer
+
+    text = _append_runtime_footer(
+        "answer body",
+        {"model_name": "gpt-test", "is_plan_mode": False, "subagent_enabled": False},
+        channel_name="feishu",
+    )
+
+    assert text == "answer body\n\n<font color='grey'>[模型：gpt-test][模式：Custom]</font>"
+
+
 async def _wait_for(condition, *, timeout=5.0, interval=0.05):
     """Poll *condition* until it returns True, or raise after *timeout* seconds."""
     import time
@@ -536,6 +548,166 @@ class TestChannelManager:
 
         _run(go())
 
+    def test_handle_chat_feishu_outbound_contains_skill_contract_metadata(self, monkeypatch):
+        from app.channels.manager import CHANNEL_CAPABILITIES, ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            run_result = {
+                "messages": [
+                    {"type": "human", "content": "hi"},
+                    {
+                        "type": "ai",
+                        "content": "ok",
+                        "metadata": {
+                            "feishu_skill_contract": {
+                                "card_schema_version": "v1",
+                                "target_channel": "feishu",
+                                "render_mode": "card",
+                                "fallback_text": "fallback",
+                            }
+                        },
+                    },
+                ]
+            }
+            mock_client = _make_mock_langgraph_client(run_result=run_result)
+            manager._client = mock_client
+
+            monkeypatch.setitem(CHANNEL_CAPABILITIES["feishu"], "supports_streaming", False)
+            await manager.start()
+            inbound = InboundMessage(channel_name="feishu", chat_id="chat1", user_id="user1", text="hi")
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            final_msg = outbound_received[-1]
+            assert isinstance(final_msg.metadata, dict)
+            contract = final_msg.metadata.get("feishu_skill_contract")
+            assert isinstance(contract, dict)
+            assert contract.get("target_channel") == "feishu"
+
+        _run(go())
+
+    def test_handle_chat_feishu_chart_intent_marks_contract_missing_when_no_contract(self, monkeypatch):
+        from app.channels.manager import CHANNEL_CAPABILITIES, ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            run_result = {
+                "messages": [
+                    {"type": "human", "content": "按天给出近7天花费趋势，并用图表展示"},
+                    {
+                        "type": "ai",
+                        "content": "最近7天呈上升趋势（文字版）",
+                    },
+                ]
+            }
+            mock_client = _make_mock_langgraph_client(run_result=run_result)
+            manager._client = mock_client
+
+            monkeypatch.setitem(CHANNEL_CAPABILITIES["feishu"], "supports_streaming", False)
+            await manager.start()
+            inbound = InboundMessage(
+                channel_name="feishu",
+                chat_id="chat1",
+                user_id="user1",
+                text="按天给出问道手游近7天花费趋势，并用图表展示",
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            final_msg = outbound_received[-1]
+            assert isinstance(final_msg.metadata, dict)
+            assert final_msg.metadata.get("feishu_chart_requested") is True
+            assert final_msg.metadata.get("feishu_contract_missing_for_chart") is True
+            assert "feishu_skill_contract" not in final_msg.metadata
+            assert "飞书渠道仅支持通过卡片图表返回可视化结果" in final_msg.text
+            assert final_msg.artifacts == []
+            assert final_msg.attachments == []
+
+        _run(go())
+
+    def test_handle_chat_feishu_chart_intent_uses_card_payload_when_contract_absent(self, monkeypatch):
+        from app.channels.manager import CHANNEL_CAPABILITIES, ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            run_result = {
+                "messages": [
+                    {"type": "human", "content": "按天给出趋势并用图表展示"},
+                    {
+                        "type": "ai",
+                        "content": "ok",
+                        "metadata": {
+                            "feishu_card_payload": {
+                                "title": "trend",
+                                "chart_spec": {
+                                    "type": "line",
+                                    "xAxis": {"type": "category", "data": ["04-21"]},
+                                    "yAxis": {"type": "value"},
+                                    "series": [{"name": "spend", "type": "line", "data": [100]}],
+                                },
+                            }
+                        },
+                    },
+                ]
+            }
+            mock_client = _make_mock_langgraph_client(run_result=run_result)
+            manager._client = mock_client
+
+            monkeypatch.setitem(CHANNEL_CAPABILITIES["feishu"], "supports_streaming", False)
+            await manager.start()
+            inbound = InboundMessage(
+                channel_name="feishu",
+                chat_id="chat1",
+                user_id="user1",
+                text="按天给出趋势并用图表展示",
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            final_msg = outbound_received[-1]
+            assert isinstance(final_msg.metadata, dict)
+            assert "feishu_skill_contract" not in final_msg.metadata
+            payload = final_msg.metadata.get("feishu_card_payload")
+            assert isinstance(payload, dict)
+            assert payload.get("chart_spec", {}).get("type") == "line"
+            assert final_msg.metadata.get("feishu_contract_missing_for_chart") is not True
+
+        _run(go())
+
     def test_handle_chat_outbound_preserves_inbound_metadata(self):
         """DingTalk (and similar) need inbound metadata on outbound sends (e.g. sender_staff_id)."""
         from app.channels.manager import ChannelManager
@@ -664,6 +836,7 @@ class TestChannelManager:
             assert call_args[1]["context"]["thinking_enabled"] is False
             assert call_args[1]["context"]["subagent_enabled"] is True
             assert call_args[1]["context"]["agent_name"] == "mobile-agent"
+            assert call_args[1]["context"]["channel_name"] == "telegram"
 
         _run(go())
 
@@ -724,6 +897,7 @@ class TestChannelManager:
             assert call_args[1]["context"]["subagent_enabled"] is True
             assert call_args[1]["context"]["agent_name"] == "vip-agent"
             assert call_args[1]["context"]["is_plan_mode"] is True
+            assert call_args[1]["context"]["channel_name"] == "telegram"
 
         _run(go())
 
@@ -827,9 +1001,209 @@ class TestChannelManager:
             await manager.stop()
 
             mock_client.runs.stream.assert_called_once()
-            assert any(msg.is_final and msg.text == "Hello world" for msg in outbound_received)
+            assert any(msg.is_final and msg.text.startswith("Hello world\n\n") for msg in outbound_received)
             assert any((not msg.is_final) and (msg.text in {"Hello", "Hello world"}) for msg in outbound_received)
             assert all(msg.thread_ts == "om-source-1" for msg in outbound_received)
+
+        _run(go())
+
+    def test_handle_feishu_stream_does_not_publish_sending_result_progress_card(self, monkeypatch):
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            stream_events = [
+                _make_stream_part(
+                    "values",
+                    {
+                        "messages": [
+                            {"type": "human", "content": "hi"},
+                            {"type": "ai", "content": "Done"},
+                        ],
+                        "artifacts": [],
+                    },
+                ),
+            ]
+
+            mock_client = _make_mock_langgraph_client()
+            mock_client.runs.stream = MagicMock(return_value=_make_async_iterator(stream_events))
+            manager._client = mock_client
+
+            await manager.start()
+
+            inbound = InboundMessage(
+                channel_name="feishu",
+                chat_id="chat1",
+                user_id="user1",
+                text="hi",
+                thread_ts="om-source-1",
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: any(m.is_final for m in outbound_received))
+            await manager.stop()
+
+            assert all(
+                not (
+                    msg.is_final is False
+                    and isinstance(msg.metadata, dict)
+                    and msg.metadata.get("status_stage") == "发送结果"
+                    and msg.metadata.get("progress_timer_running") is True
+                )
+                for msg in outbound_received
+            )
+
+        _run(go())
+
+    def test_handle_feishu_stream_final_outbound_contains_skill_contract_metadata(self, monkeypatch):
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            stream_events = [
+                _make_stream_part(
+                    "messages-tuple",
+                    [
+                        {
+                            "id": "ai-1",
+                            "type": "ai",
+                            "content": "",
+                            "metadata": {
+                                "feishu_skill_contract": {
+                                    "card_schema_version": "v1",
+                                    "target_channel": "feishu",
+                                    "render_mode": "card",
+                                    "fallback_text": "fallback",
+                                }
+                            },
+                        },
+                        {"langgraph_node": "agent"},
+                    ],
+                ),
+                _make_stream_part(
+                    "values",
+                    {
+                        "messages": [
+                            {"type": "human", "content": "hi"},
+                            {"type": "ai", "content": "Hello world"},
+                        ],
+                        "artifacts": [],
+                    },
+                ),
+            ]
+
+            mock_client = _make_mock_langgraph_client()
+            mock_client.runs.stream = MagicMock(return_value=_make_async_iterator(stream_events))
+            manager._client = mock_client
+
+            await manager.start()
+
+            inbound = InboundMessage(
+                channel_name="feishu",
+                chat_id="chat1",
+                user_id="user1",
+                text="hi",
+                thread_ts="om-source-1",
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: any(m.is_final for m in outbound_received))
+            await manager.stop()
+
+            final_msg = [m for m in outbound_received if m.is_final][-1]
+            assert isinstance(final_msg.metadata, dict)
+            contract = final_msg.metadata.get("feishu_skill_contract")
+            assert isinstance(contract, dict)
+            assert contract.get("target_channel") == "feishu"
+
+        _run(go())
+
+    def test_handle_feishu_stream_final_outbound_uses_card_payload_when_contract_absent(self, monkeypatch):
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            stream_events = [
+                _make_stream_part(
+                    "values",
+                    {
+                        "messages": [
+                            {"type": "human", "content": "按天给出趋势并用图表展示"},
+                            {
+                                "type": "ai",
+                                "content": "ok",
+                                "metadata": {
+                                    "feishu_card_payload": {
+                                        "title": "trend",
+                                        "chart_spec": {
+                                            "type": "line",
+                                            "xAxis": {"type": "category", "data": ["04-21"]},
+                                            "yAxis": {"type": "value"},
+                                            "series": [{"name": "spend", "type": "line", "data": [100]}],
+                                        },
+                                    }
+                                },
+                            },
+                        ]
+                    },
+                ),
+            ]
+            mock_client = _make_mock_langgraph_client()
+            mock_client.runs.stream = MagicMock(return_value=_make_async_iterator(stream_events))
+            manager._client = mock_client
+
+            await manager.start()
+            inbound = InboundMessage(
+                channel_name="feishu",
+                chat_id="chat1",
+                user_id="user1",
+                text="按天给出趋势并用图表展示",
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: any(item.is_final for item in outbound_received))
+            await manager.stop()
+
+            final_msg = [item for item in outbound_received if item.is_final][-1]
+            assert isinstance(final_msg.metadata, dict)
+            assert "feishu_skill_contract" not in final_msg.metadata
+            payload = final_msg.metadata.get("feishu_card_payload")
+            assert isinstance(payload, dict)
+            assert payload.get("chart_spec", {}).get("type") == "line"
+            assert final_msg.metadata.get("feishu_contract_missing_for_chart") is not True
 
         _run(go())
 
@@ -885,11 +1259,11 @@ class TestChannelManager:
 
         _run(go())
 
-    def test_handle_feishu_stream_conflict_sends_busy_message(self, monkeypatch):
+    def test_handle_feishu_stream_conflict_recreates_thread_and_retries(self, monkeypatch):
         import httpx
         from langgraph_sdk.errors import ConflictError
 
-        from app.channels.manager import THREAD_BUSY_MESSAGE, ChannelManager
+        from app.channels.manager import ChannelManager
 
         monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
 
@@ -905,18 +1279,41 @@ class TestChannelManager:
 
             bus.subscribe_outbound(capture_outbound)
 
-            async def _conflict_stream():
-                request = httpx.Request("POST", "http://127.0.0.1:2024/runs")
-                response = httpx.Response(409, request=request)
-                raise ConflictError(
-                    "Thread is already running a task. Wait for it to finish or choose a different multitask strategy.",
-                    response=response,
-                    body={"message": "Thread is already running a task. Wait for it to finish or choose a different multitask strategy."},
-                )
-                yield  # pragma: no cover
+            request = httpx.Request("POST", "http://127.0.0.1:2024/runs")
+            response = httpx.Response(409, request=request)
+            conflict = ConflictError(
+                "Thread is already running a task. Wait for it to finish or choose a different multitask strategy.",
+                response=response,
+                body={"message": "Thread is already running a task. Wait for it to finish or choose a different multitask strategy."},
+            )
+            stream_calls = {"count": 0}
 
-            mock_client = _make_mock_langgraph_client()
-            mock_client.runs.stream = MagicMock(return_value=_conflict_stream())
+            def stream_side_effect(*args, **kwargs):
+                stream_calls["count"] += 1
+                if stream_calls["count"] == 1:
+
+                    async def first_attempt():
+                        raise conflict
+                        yield  # pragma: no cover
+
+                    return first_attempt()
+                return _make_async_iterator(
+                    [
+                        _make_stream_part(
+                            "values",
+                            {
+                                "messages": [
+                                    {"type": "human", "content": "hi"},
+                                    {"type": "ai", "content": "Recovered after busy"},
+                                ],
+                                "artifacts": [],
+                            },
+                        )
+                    ]
+                )
+
+            mock_client = _make_mock_langgraph_client(thread_id="new-thread-after-busy")
+            mock_client.runs.stream = MagicMock(side_effect=stream_side_effect)
             manager._client = mock_client
 
             await manager.start()
@@ -933,9 +1330,94 @@ class TestChannelManager:
             await manager.stop()
 
             final_msgs = [m for m in outbound_received if m.is_final]
+            assert stream_calls["count"] == 2
+            assert mock_client.threads.create.await_count == 2
             assert len(final_msgs) == 1
-            assert final_msgs[0].text == THREAD_BUSY_MESSAGE
+            assert final_msgs[0].text.startswith("Recovered after busy\n\n")
+            assert final_msgs[0].thread_id == "new-thread-after-busy"
             assert final_msgs[0].thread_ts == "om-source-1"
+
+        _run(go())
+
+    def test_handle_feishu_stream_thread_not_found_recreates_thread_and_retries(self, monkeypatch):
+        import httpx
+
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+            store.set_thread_id("feishu", "chat1", "old-thread", topic_id="topic-1", user_id="user1")
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            request = httpx.Request("POST", "http://127.0.0.1:2024/runs/stream")
+            response = httpx.Response(404, request=request)
+            not_found_error = httpx.HTTPStatusError(
+                "404 Client Error: Thread or assistant not found",
+                request=request,
+                response=response,
+            )
+
+            stream_events = [
+                _make_stream_part(
+                    "values",
+                    {
+                        "messages": [
+                            {"type": "human", "content": "hi"},
+                            {"type": "ai", "content": "Recovered reply"},
+                        ],
+                        "artifacts": [],
+                    },
+                ),
+            ]
+            stream_calls = {"count": 0}
+
+            def stream_side_effect(*args, **kwargs):
+                stream_calls["count"] += 1
+                if stream_calls["count"] == 1:
+
+                    async def first_attempt():
+                        raise not_found_error
+                        yield  # pragma: no cover
+
+                    return first_attempt()
+                return _make_async_iterator(stream_events)
+
+            mock_client = _make_mock_langgraph_client(thread_id="new-thread-xyz")
+            mock_client.runs.stream = MagicMock(side_effect=stream_side_effect)
+            manager._client = mock_client
+
+            await manager.start()
+
+            inbound = InboundMessage(
+                channel_name="feishu",
+                chat_id="chat1",
+                topic_id="topic-1",
+                user_id="user1",
+                text="hi",
+                thread_ts="om-source-1",
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: any(m.is_final for m in outbound_received))
+            await manager.stop()
+
+            assert stream_calls["count"] == 2
+            mock_client.threads.create.assert_called_once()
+            assert store.get_thread_id("feishu", "chat1", topic_id="topic-1") == "new-thread-xyz"
+
+            final_msgs = [m for m in outbound_received if m.is_final]
+            assert len(final_msgs) == 1
+            assert final_msgs[0].text.startswith("Recovered reply\n\n")
+            assert final_msgs[0].thread_id == "new-thread-xyz"
 
         _run(go())
 
@@ -1348,7 +1830,7 @@ class TestChannelManager:
             # Final message should be published
             final_msgs = [m for m in outbound_received if m.is_final]
             assert len(final_msgs) == 1
-            assert final_msgs[0].text == "Bootstrap done"
+            assert final_msgs[0].text.startswith("Bootstrap done\n\n")
 
         _run(go())
 
@@ -1509,6 +1991,201 @@ class TestExtractArtifacts:
             ]
         }
         assert _extract_artifacts(result) == ["/mnt/user-data/outputs/a.txt", "/mnt/user-data/outputs/b.csv"]
+
+
+class TestExtractFeishuSkillContract:
+    def test_extract_from_latest_ai_turn(self):
+        from app.channels.manager import _extract_feishu_skill_contract
+
+        result = {
+            "messages": [
+                {"type": "human", "content": "hi"},
+                {
+                    "type": "ai",
+                    "content": "report",
+                    "metadata": {
+                        "feishu_skill_contract": {
+                            "card_schema_version": "v1",
+                            "target_channel": "feishu",
+                            "render_mode": "card",
+                            "fallback_text": "fallback",
+                        }
+                    },
+                },
+            ]
+        }
+        contract = _extract_feishu_skill_contract(result)
+        assert isinstance(contract, dict)
+        assert contract["target_channel"] == "feishu"
+
+    def test_ignores_previous_turn_contract(self):
+        from app.channels.manager import _extract_feishu_skill_contract
+
+        result = {
+            "messages": [
+                {
+                    "type": "ai",
+                    "content": "old",
+                    "metadata": {
+                        "feishu_skill_contract": {
+                            "card_schema_version": "v1",
+                            "target_channel": "feishu",
+                            "render_mode": "card",
+                            "fallback_text": "old",
+                        }
+                    },
+                },
+                {"type": "human", "content": "new question"},
+                {"type": "ai", "content": "new answer"},
+            ]
+        }
+        assert _extract_feishu_skill_contract(result) is None
+
+    def test_extract_from_ai_text_json_metadata_wrapper(self):
+        from app.channels.manager import _extract_feishu_skill_contract
+
+        result = {
+            "messages": [
+                {"type": "human", "content": "可以"},
+                {
+                    "type": "ai",
+                    "content": json.dumps(
+                        {
+                            "metadata": {
+                                "feishu_skill_contract": {
+                                    "card_schema_version": "v1",
+                                    "target_channel": "feishu",
+                                    "render_mode": "card",
+                                    "fallback_text": "fallback",
+                                    "card_payload": {
+                                        "title": "近7天趋势",
+                                        "blocks": [],
+                                    },
+                                }
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ]
+        }
+
+        contract = _extract_feishu_skill_contract(result)
+        assert isinstance(contract, dict)
+        assert contract.get("target_channel") == "feishu"
+
+    def test_extract_from_ai_text_json_fenced_block(self):
+        from app.channels.manager import _extract_feishu_skill_contract
+
+        result = {
+            "messages": [
+                {"type": "human", "content": "ok"},
+                {
+                    "type": "ai",
+                    "content": (
+                        "下面是结果：\n"
+                        "```json\n"
+                        '{"metadata":{"feishu_skill_contract":{"card_schema_version":"v1","target_channel":"feishu","render_mode":"card","fallback_text":"fallback","card_payload":{"blocks":[{"type":"chart","chart":{"chart_type":"line","dimension":{"name":"date","values":["04-21"]},"metrics":[{"name":"spend","values":[100]}]}}]}}}}\n'
+                        "```"
+                    ),
+                },
+            ]
+        }
+
+        contract = _extract_feishu_skill_contract(result)
+        assert isinstance(contract, dict)
+        assert contract.get("target_channel") == "feishu"
+
+    def test_extract_contract_from_ai_content_blocks_text(self):
+        from app.channels.manager import _extract_feishu_skill_contract
+
+        result = {
+            "messages": [
+                {"type": "human", "content": "ok"},
+                {
+                    "type": "ai",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": '{"metadata":{"feishu_skill_contract":{"card_schema_version":"v1","target_channel":"feishu","render_mode":"card","fallback_text":"fallback"}}}',
+                        }
+                    ],
+                },
+            ]
+        }
+
+        contract = _extract_feishu_skill_contract(result)
+        assert isinstance(contract, dict)
+        assert contract.get("target_channel") == "feishu"
+
+    def test_extract_card_payload_from_latest_ai_turn(self):
+        from app.channels.manager import _extract_feishu_card_payload
+
+        result = {
+            "messages": [
+                {"type": "human", "content": "chart"},
+                {
+                    "type": "ai",
+                    "content": "ok",
+                    "metadata": {
+                        "feishu_card_payload": {
+                            "title": "trend",
+                            "chart_spec": {
+                                "type": "line",
+                                "series": [{"name": "spend", "type": "line", "data": [1, 2]}],
+                            },
+                        }
+                    },
+                },
+            ]
+        }
+
+        payload = _extract_feishu_card_payload(result)
+        assert isinstance(payload, dict)
+        assert payload.get("chart_spec", {}).get("type") == "line"
+
+    def test_extract_card_payload_from_ai_text_json_fenced_block(self):
+        from app.channels.manager import _extract_feishu_card_payload
+
+        result = {
+            "messages": [
+                {"type": "human", "content": "chart"},
+                {
+                    "type": "ai",
+                    "content": (
+                        "```json\n"
+                        '{"metadata":{"feishu_card_payload":{"title":"trend","chart_spec":{"type":"line","series":[]}}}}\n'
+                        "```"
+                    ),
+                },
+            ]
+        }
+
+        payload = _extract_feishu_card_payload(result)
+        assert isinstance(payload, dict)
+        assert payload.get("chart_spec", {}).get("type") == "line"
+
+    def test_extract_card_payload_from_ai_content_blocks_text(self):
+        from app.channels.manager import _extract_feishu_card_payload
+
+        result = {
+            "messages": [
+                {"type": "human", "content": "chart"},
+                {
+                    "type": "ai",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": '{"metadata":{"feishu_card_payload":{"title":"trend","chart_spec":{"type":"line","series":[]}}}}',
+                        }
+                    ],
+                },
+            ]
+        }
+
+        payload = _extract_feishu_card_payload(result)
+        assert isinstance(payload, dict)
+        assert payload.get("chart_spec", {}).get("type") == "line"
 
 
 class TestFormatArtifactText:
@@ -1706,6 +2383,120 @@ class TestHandleChatWithArtifacts:
 
 
 class TestFeishuChannel:
+    def test_feishu_send_auto_mode_keeps_markdown_table_as_text(self):
+        from app.channels.feishu import FeishuChannel
+
+        async def go():
+            bus = MessageBus()
+            channel = FeishuChannel(bus, config={"app_id": "id", "app_secret": "secret", "render_mode": "auto"})
+            channel._api_client = MagicMock()
+            channel._send_text_message = AsyncMock(return_value=None)
+            channel._send_card_message = AsyncMock(return_value=None)
+
+            msg = OutboundMessage(
+                channel_name="feishu",
+                chat_id="chat-1",
+                thread_id="thread-1",
+                text="| date | spend |\n| --- | --- |\n| 2026-04-20 | 100 |",
+                is_final=True,
+                thread_ts="source-msg-1",
+            )
+
+            await channel.send(msg, _max_retries=1)
+
+            channel._send_text_message.assert_awaited_once()
+            channel._send_card_message.assert_not_awaited()
+
+        _run(go())
+
+    def test_feishu_send_guardrails_script_permission_prompt(self):
+        from app.channels.feishu import FeishuChannel
+
+        async def go():
+            bus = MessageBus()
+            channel = FeishuChannel(bus, config={"app_id": "id", "app_secret": "secret", "render_mode": "text"})
+            channel._api_client = MagicMock()
+            channel._send_text_message = AsyncMock(return_value=None)
+            channel._send_card_message = AsyncMock(return_value=None)
+
+            msg = OutboundMessage(
+                channel_name="feishu",
+                chat_id="chat-1",
+                thread_id="thread-1",
+                text="执行 bash 命令被安全策略拦截了。是否允许我执行该脚本？允许执行脚本 / 使用其他方式输出",
+                is_final=True,
+                thread_ts="source-msg-guardrail-1",
+            )
+
+            await channel.send(msg, _max_retries=1)
+
+            channel._send_text_message.assert_awaited_once()
+            forwarded = channel._send_text_message.await_args.args[0]
+            assert "是否允许我执行该脚本" not in forwarded.text
+            assert "允许执行脚本" not in forwarded.text
+            assert "feishu_skill_contract" in forwarded.text
+            assert channel._script_permission_guardrail_hits == 1
+
+        _run(go())
+
+    def test_feishu_send_guardrail_logs_and_counts_hits(self, caplog):
+        from app.channels.feishu import FeishuChannel
+
+        async def go():
+            bus = MessageBus()
+            channel = FeishuChannel(bus, config={"app_id": "id", "app_secret": "secret", "render_mode": "text"})
+            channel._api_client = MagicMock()
+            channel._send_text_message = AsyncMock(return_value=None)
+            channel._send_card_message = AsyncMock(return_value=None)
+
+            msg = OutboundMessage(
+                channel_name="feishu",
+                chat_id="chat-1",
+                thread_id="thread-1",
+                text="allow me to execute the script and continue",
+                is_final=True,
+                thread_ts="source-msg-guardrail-2",
+            )
+
+            with caplog.at_level("WARNING"):
+                await channel.send(msg, _max_retries=1)
+
+            assert channel._script_permission_guardrail_hits == 1
+            assert "script-permission guardrail hit" in caplog.text
+
+        _run(go())
+
+    def test_feishu_send_counts_contract_missing_for_chart_metric(self, caplog):
+        from app.channels.feishu import FeishuChannel
+
+        async def go():
+            bus = MessageBus()
+            channel = FeishuChannel(bus, config={"app_id": "id", "app_secret": "secret", "render_mode": "text"})
+            channel._api_client = MagicMock()
+            channel._send_text_message = AsyncMock(return_value=None)
+            channel._send_card_message = AsyncMock(return_value=None)
+
+            msg = OutboundMessage(
+                channel_name="feishu",
+                chat_id="chat-1",
+                thread_id="thread-1",
+                text="最近7天花费整体上升（文字版）",
+                is_final=True,
+                thread_ts="source-msg-contract-missing-1",
+                metadata={
+                    "feishu_chart_requested": True,
+                    "feishu_contract_missing_for_chart": True,
+                },
+            )
+
+            with caplog.at_level("WARNING"):
+                await channel.send(msg, _max_retries=1)
+
+            assert channel._contract_missing_for_chart_hits == 1
+            assert "chart contract missing for chart-intent request" in caplog.text
+
+        _run(go())
+
     def test_prepare_inbound_publishes_without_waiting_for_running_card(self):
         from app.channels.feishu import FeishuChannel
 
@@ -2048,10 +2839,33 @@ class TestChannelService:
             for ch_status in status["channels"].values():
                 assert ch_status["enabled"] is False
                 assert ch_status["running"] is False
+                assert ch_status["metrics"] == {}
 
             await service.stop()
 
         _run(go())
+
+    def test_get_status_includes_feishu_runtime_metrics(self):
+        from app.channels.feishu import FeishuChannel
+        from app.channels.service import ChannelService
+
+        service = ChannelService(
+            channels_config={
+                "feishu": {"enabled": True, "app_id": "id", "app_secret": "secret"},
+            }
+        )
+
+        channel = FeishuChannel(service.bus, config={"app_id": "id", "app_secret": "secret"})
+        channel._running = True
+        channel._script_permission_guardrail_hits = 3
+        service._channels["feishu"] = channel
+        service._running = True
+
+        status = service.get_status()
+        feishu = status["channels"]["feishu"]
+        assert feishu["enabled"] is True
+        assert feishu["running"] is True
+        assert feishu["metrics"]["script_permission_guardrail_hits"] == 3
 
     def test_disabled_channels_are_skipped(self):
         from app.channels.service import ChannelService

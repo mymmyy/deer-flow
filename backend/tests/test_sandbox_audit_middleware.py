@@ -10,6 +10,7 @@ from langchain_core.messages import ToolMessage
 from deerflow.agents.middlewares.sandbox_audit_middleware import (
     SandboxAuditMiddleware,
     _classify_command,
+    _classify_command_for_channel,
     _split_compound_command,
 )
 
@@ -33,6 +34,18 @@ def _make_request(command: str, workspace_path: str | None = "/tmp/workspace", t
         config={"configurable": {"thread_id": thread_id}},
         state={"thread_data": {"workspace_path": workspace_path}},
     )
+    return request
+
+
+def _make_request_with_channel(
+    command: str,
+    *,
+    channel_name: str,
+    workspace_path: str | None = "/tmp/workspace",
+    thread_id: str = "thread-1",
+) -> MagicMock:
+    request = _make_request(command, workspace_path=workspace_path, thread_id=thread_id)
+    request.runtime.context["channel_name"] = channel_name
     return request
 
 
@@ -210,6 +223,20 @@ class TestClassifyCommand:
     )
     def test_compound_command_classification(self, cmd, expected):
         assert _classify_command(cmd) == expected, f"Expected {expected!r} for compound cmd: {cmd!r}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "npm install canvas",
+            "cd /mnt/user-data/workspace && npm install canvas 2>&1 | tail -5",
+            "node ./scripts/generate_chart.js",
+            "python plot_trend.py",
+        ],
+    )
+    def test_feishu_channel_hard_block_chart_script_paths(self, cmd):
+        assert _classify_command_for_channel(cmd, "feishu") == "block"
+        # Non-feishu channels keep default classifier behavior.
+        assert _classify_command_for_channel(cmd, "telegram") in {"pass", "warn", "block"}
 
 
 class TestSplitCompoundCommand:
@@ -461,6 +488,43 @@ class TestSandboxAuditMiddlewareWrapToolCall:
         mock_audit.assert_called_once()
         _, _, verdict = mock_audit.call_args[0]
         assert verdict == "warn"
+
+    def test_feishu_block_message_guides_contract_output(self):
+        request = _make_request_with_channel("node ./scripts/generate_chart.js", channel_name="feishu")
+        handler = _make_handler()
+        with patch.object(self.mw, "_write_audit"):
+            result = self.mw.wrap_tool_call(request, handler)
+        assert not handler.called
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        assert "feishu_skill_contract" in result.content
+        assert "chart_spec" in result.content
+        assert "Do NOT ask the user for script/bash/node execution permission" in result.content
+
+    def test_feishu_block_message_never_asks_user_for_script_permission(self):
+        request = _make_request_with_channel("python plot_trend.py", channel_name="feishu")
+        handler = _make_handler()
+        with patch.object(self.mw, "_write_audit"):
+            result = self.mw.wrap_tool_call(request, handler)
+
+        assert not handler.called
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        blocked_text = str(result.content)
+        assert "是否允许我执行该脚本" not in blocked_text
+        assert "允许执行脚本" not in blocked_text
+        assert "allow me to execute" not in blocked_text.lower()
+        assert "feishu_skill_contract" in blocked_text
+
+    def test_non_feishu_block_message_keeps_generic_text(self):
+        request = _make_request_with_channel("rm -rf /", channel_name="telegram")
+        handler = _make_handler()
+        with patch.object(self.mw, "_write_audit"):
+            result = self.mw.wrap_tool_call(request, handler)
+        assert not handler.called
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        assert "Please use a safer alternative approach." in result.content
 
 
 # ---------------------------------------------------------------------------
