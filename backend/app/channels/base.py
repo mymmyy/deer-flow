@@ -38,6 +38,10 @@ class Channel(ABC):
         """
         return {}
 
+    @property
+    def supports_streaming(self) -> bool:
+        return False
+
     # -- lifecycle ---------------------------------------------------------
 
     @abstractmethod
