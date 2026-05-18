@@ -68,6 +68,27 @@ class RunResponse(BaseModel):
     updated_at: str = ""
 
 
+class ThreadTokenUsageModelBreakdown(BaseModel):
+    tokens: int = 0
+    runs: int = 0
+
+
+class ThreadTokenUsageCallerBreakdown(BaseModel):
+    lead_agent: int = 0
+    subagent: int = 0
+    middleware: int = 0
+
+
+class ThreadTokenUsageResponse(BaseModel):
+    thread_id: str
+    total_tokens: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_runs: int = 0
+    by_model: dict[str, ThreadTokenUsageModelBreakdown] = Field(default_factory=dict)
+    by_caller: ThreadTokenUsageCallerBreakdown = Field(default_factory=ThreadTokenUsageCallerBreakdown)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -159,7 +180,8 @@ async def wait_run(thread_id: str, body: RunCreateRequest, request: Request) -> 
 async def list_runs(thread_id: str, request: Request) -> list[RunResponse]:
     """List all runs for a thread."""
     run_mgr = get_run_manager(request)
-    records = await run_mgr.list_by_thread(thread_id)
+    user_id = await get_current_user(request)
+    records = await run_mgr.list_by_thread(thread_id, user_id=user_id)
     return [_record_to_response(r) for r in records]
 
 
@@ -168,7 +190,8 @@ async def list_runs(thread_id: str, request: Request) -> list[RunResponse]:
 async def get_run(thread_id: str, run_id: str, request: Request) -> RunResponse:
     """Get details of a specific run."""
     run_mgr = get_run_manager(request)
-    record = run_mgr.get(run_id)
+    user_id = await get_current_user(request)
+    record = await run_mgr.aget(run_id, user_id=user_id)
     if record is None or record.thread_id != thread_id:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     return _record_to_response(record)
@@ -368,10 +391,10 @@ async def list_run_events(
     return await event_store.list_events(thread_id, run_id, event_types=types, limit=limit)
 
 
-@router.get("/{thread_id}/token-usage")
+@router.get("/{thread_id}/token-usage", response_model=ThreadTokenUsageResponse)
 @require_permission("threads", "read", owner_check=True)
-async def thread_token_usage(thread_id: str, request: Request) -> dict:
+async def thread_token_usage(thread_id: str, request: Request) -> ThreadTokenUsageResponse:
     """Thread-level token usage aggregation."""
     run_store = get_run_store(request)
     agg = await run_store.aggregate_tokens_by_thread(thread_id)
-    return {"thread_id": thread_id, **agg}
+    return ThreadTokenUsageResponse(thread_id=thread_id, **agg)

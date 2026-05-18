@@ -23,6 +23,7 @@ class RunStore(abc.ABC):
         thread_id: str,
         assistant_id: str | None = None,
         user_id: str | None = None,
+        model_name: str | None = None,
         status: str = "pending",
         multitask_strategy: str = "reject",
         metadata: dict[str, Any] | None = None,
@@ -33,7 +34,12 @@ class RunStore(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def get(self, run_id: str) -> dict[str, Any] | None:
+    async def get(
+        self,
+        run_id: str,
+        *,
+        user_id: str | None = None,
+    ) -> dict[str, Any] | None:
         pass
 
     @abc.abstractmethod
