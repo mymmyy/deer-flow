@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage
 
-from deerflow.models.patched_openai import _restore_tool_call_signatures
+from deerflow.models.patched_openai import (
+    _restore_tool_call_signatures,
+    _rewrite_disallowed_system_roles,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -174,3 +177,33 @@ def test_tool_call_multiple_sequential_signatures():
 
 # Integration behavior for PatchedChatOpenAI is validated indirectly via
 # _restore_tool_call_signatures unit coverage above.
+
+
+def test_rewrite_system_role_in_chat_messages():
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hello"},
+        ]
+    }
+
+    _rewrite_disallowed_system_roles(payload)
+
+    assert payload["messages"][0]["role"] == "developer"
+    assert payload["messages"][1]["role"] == "user"
+
+
+def test_rewrite_system_role_in_responses_input_messages():
+    payload = {
+        "input": [
+            {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "You are helpful."}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+        ]
+    }
+
+    _rewrite_disallowed_system_roles(payload)
+
+    assert payload["input"][0]["role"] == "developer"
+    assert payload["input"][1]["role"] == "user"
+    assert payload["input"][2]["type"] == "function_call_output"

@@ -12,7 +12,7 @@ from typing import Any, Mapping
 CONTRACT_VERSION = "v1"
 TARGET_CHANNEL = "feishu"
 RENDER_MODES = {"text", "card"}
-BLOCK_TYPES = {"markdown", "table", "chart"}
+BLOCK_TYPES = {"markdown", "table", "chart", "image"}
 CHART_TYPES = {"line", "bar", "pie", "scatter", "combo_bar_line"}
 COMBO_SERIES_TYPES = {"bar", "line"}
 COMBO_Y_AXIS = {"left", "right"}
@@ -23,6 +23,12 @@ DEFAULT_FALLBACK_TEXT = "Card rendering is unavailable. Please check the text re
 class ContractValidationResult:
     ok: bool
     normalized: dict[str, Any] | None
+    errors: list[str]
+
+
+@dataclass
+class ContractQualityResult:
+    ok: bool
     errors: list[str]
 
 
@@ -117,6 +123,13 @@ def _normalize_chart_block(block: dict[str, Any], errors: list[str], index: int)
         return None
 
     title = _as_str(chart.get("title")).strip()
+    if not title:
+        errors.append(f"blocks[{index}].chart.title must be a non-empty string")
+        return None
+    why_this_chart = _as_str(chart.get("why_this_chart")).strip()
+    if not why_this_chart:
+        errors.append(f"blocks[{index}].chart.why_this_chart must be a non-empty string")
+        return None
     dimension = _as_dict(chart.get("dimension"))
     dim_name = _as_str(dimension.get("name")).strip()
     dim_values_raw = _as_list(dimension.get("values"))
@@ -187,13 +200,38 @@ def _normalize_chart_block(block: dict[str, Any], errors: list[str], index: int)
 
     normalized_chart: dict[str, Any] = {
         "chart_type": chart_type,
+        "title": title,
+        "why_this_chart": why_this_chart,
         "dimension": {"name": dim_name, "values": dim_values},
         "metrics": normalized_metrics,
     }
-    if title:
-        normalized_chart["title"] = title
 
     return {"type": "chart", "chart": normalized_chart}
+
+
+def _normalize_image_block(block: dict[str, Any], errors: list[str], index: int) -> dict[str, Any] | None:
+    image = _as_dict(block.get("image"))
+    if not image:
+        errors.append(f"blocks[{index}].image must be an object")
+        return None
+
+    image_key = _as_str(image.get("image_key")).strip()
+    if not image_key:
+        errors.append(f"blocks[{index}].image.image_key must be a non-empty string")
+        return None
+
+    caption = _as_str(image.get("caption")).strip()
+    if not caption:
+        errors.append(f"blocks[{index}].image.caption must be a non-empty string")
+        return None
+
+    return {
+        "type": "image",
+        "image": {
+            "image_key": image_key,
+            "caption": caption,
+        },
+    }
 
 
 def validate_and_normalize_contract(
@@ -238,6 +276,10 @@ def validate_and_normalize_contract(
         else:
             title = _as_str(card_payload.get("title")).strip()
             summary = _as_str(card_payload.get("summary")).strip()
+            if not title:
+                errors.append("card_payload.title must be a non-empty string")
+            if not summary:
+                errors.append("card_payload.summary must be a non-empty string")
             blocks_raw = _as_list(card_payload.get("blocks"))
             if not blocks_raw:
                 errors.append("card_payload.blocks must be a non-empty array")
@@ -260,6 +302,8 @@ def validate_and_normalize_contract(
                         normalized_block = _normalize_table_block(block, errors, idx)
                     elif block_type == "chart":
                         normalized_block = _normalize_chart_block(block, errors, idx)
+                    elif block_type == "image":
+                        normalized_block = _normalize_image_block(block, errors, idx)
 
                     if normalized_block is not None:
                         normalized_blocks.append(normalized_block)
@@ -274,3 +318,75 @@ def validate_and_normalize_contract(
 
     return ContractValidationResult(ok=not errors, normalized=normalized if not errors else None, errors=errors)
 
+
+def validate_contract_quality(raw: Any) -> ContractQualityResult:
+    errors: list[str] = []
+    if not isinstance(raw, Mapping):
+        return ContractQualityResult(ok=False, errors=["contract must be an object"])
+
+    source = dict(raw)
+    render_mode = _as_str(source.get("render_mode")).strip().lower()
+    if render_mode != "card":
+        return ContractQualityResult(ok=True, errors=[])
+
+    card_payload = _as_dict(source.get("card_payload"))
+    title = _as_str(card_payload.get("title")).strip()
+    summary = _as_str(card_payload.get("summary")).strip()
+    blocks = _as_list(card_payload.get("blocks"))
+
+    if not title:
+        errors.append("missing card title")
+    if not summary:
+        errors.append("missing card summary")
+    if len(blocks) < 2:
+        errors.append("card must contain at least 2 blocks")
+
+    markdown_count = 0
+    chart_count = 0
+    data_block_count = 0
+    image_count = 0
+
+    for idx, block_raw in enumerate(blocks):
+        if not isinstance(block_raw, Mapping):
+            continue
+        block = dict(block_raw)
+        block_type = _as_str(block.get("type")).strip().lower()
+        if block_type == "markdown":
+            markdown = _as_str(block.get("markdown")).strip()
+            if markdown:
+                markdown_count += 1
+        elif block_type == "table":
+            data_block_count += 1
+        elif block_type == "chart":
+            chart_count += 1
+            data_block_count += 1
+            chart = _as_dict(block.get("chart"))
+            if not _as_str(chart.get("title")).strip():
+                errors.append(f"blocks[{idx}] chart missing title")
+            if not _as_str(chart.get("why_this_chart")).strip():
+                errors.append(f"blocks[{idx}] chart missing why_this_chart")
+        elif block_type == "image":
+            image_count += 1
+            image = _as_dict(block.get("image"))
+            if not _as_str(image.get("caption")).strip():
+                errors.append(f"blocks[{idx}] image missing caption")
+
+    if markdown_count == 0:
+        errors.append("card must contain at least 1 markdown conclusion block")
+    if chart_count > 0 and markdown_count == 0:
+        errors.append("chart-only card is not allowed")
+    table_count = sum(
+        1
+        for block_raw in blocks
+        if isinstance(block_raw, Mapping) and _as_str(dict(block_raw).get("type")).strip().lower() == "table"
+    )
+    if chart_count > 0 and table_count > 0:
+        errors.append("card must not contain both chart and table blocks")
+    if data_block_count == 0:
+        errors.append("deep analysis card must contain at least 1 data block")
+    if len(blocks) > 3 and data_block_count < 2:
+        errors.append("multi-point analysis requires more than 1 supporting data block")
+    if image_count > 0 and markdown_count == 0:
+        errors.append("image blocks require textual context")
+
+    return ContractQualityResult(ok=not errors, errors=errors)

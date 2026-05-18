@@ -16,6 +16,12 @@ import httpx
 from langgraph_sdk.errors import ConflictError
 
 from app.channels.commands import KNOWN_CHANNEL_COMMANDS
+from app.channels.feishu_contract import validate_and_normalize_contract, validate_contract_quality
+from app.channels.feishu_presentation_builder import (
+    build_feishu_presentation_prompt,
+    build_feishu_presentation_retry_feedback,
+    extract_feishu_skill_contract_candidate,
+)
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from app.channels.store import ChannelStore
 from app.gateway.csrf_middleware import CSRF_COOKIE_NAME, CSRF_HEADER_NAME, generate_csrf_token
@@ -45,6 +51,7 @@ MAX_PROGRESS_TIMELINE_EVENTS = 200
 STREAM_ATTEMPT_TIMEOUT_SECONDS = 45.0
 STREAM_MAX_RETRIES = 2
 STREAM_RETRY_BASE_DELAY_SECONDS = 0.6
+FEISHU_PRESENTATION_MAX_RETRIES = 2
 
 CHANNEL_CAPABILITIES = {
     "dingtalk": {"supports_streaming": False},
@@ -793,6 +800,22 @@ def _extract_feishu_card_payload_from_stream_payload(payload: Any) -> dict[str, 
     return _extract_feishu_card_payload_from_mapping(payload)
 
 
+def _is_structured_feishu_contract_text(text: str) -> bool:
+    """Return True when *text* looks like a raw Feishu contract/card JSON blob."""
+    if not isinstance(text, str):
+        return False
+    candidate = text.strip()
+    if not candidate:
+        return False
+    if "feishu_skill_contract" in candidate or "feishu_card_payload" in candidate:
+        return True
+    if candidate.startswith("{") and (
+        '"target_channel": "feishu"' in candidate or '"target_channel":"feishu"' in candidate
+    ):
+        return True
+    return False
+
+
 def _feishu_payload_source_label(
     *,
     has_contract: bool,
@@ -1031,6 +1054,20 @@ def _format_uploaded_files_block(files: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _build_feishu_presentation_failure_text(response_text: str, reasons: list[str]) -> str:
+    body = (response_text or "").strip()
+    lines: list[str] = []
+    if body:
+        lines.append(body)
+        lines.append("")
+    lines.append("可视化展示生成失败：")
+    for reason in reasons[:3]:
+        lines.append(f"- {reason}")
+    lines.append("")
+    lines.append("已改为发送文字版结果。")
+    return "\n".join(lines).strip()
+
+
 class ChannelManager:
     """Core dispatcher that bridges IM channels to the DeerFlow agent.
 
@@ -1190,6 +1227,67 @@ class ChannelManager:
             )
         return self._client
 
+    async def _generate_feishu_presentation_contract(
+        self,
+        client,
+        *,
+        analysis_text: str,
+        artifacts: list[str],
+        attachments: list[ResolvedAttachment],
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        retry_feedback = None
+        latest_errors: list[str] = []
+        attachment_payload = [
+            {
+                "filename": item.filename,
+                "mime_type": item.mime_type,
+                "is_image": item.is_image,
+                "virtual_path": item.virtual_path,
+            }
+            for item in attachments
+        ]
+
+        for _attempt in range(FEISHU_PRESENTATION_MAX_RETRIES + 1):
+            prompt = build_feishu_presentation_prompt(
+                analysis_text=analysis_text,
+                artifacts=artifacts,
+                attachments=attachment_payload,
+                retry_feedback=retry_feedback,
+            )
+            thread = await client.threads.create()
+            result = await client.runs.wait(
+                thread["thread_id"],
+                DEFAULT_ASSISTANT_ID,
+                input={"messages": [{"role": "human", "content": prompt}]},
+                config=DEFAULT_RUN_CONFIG,
+                context={
+                    **DEFAULT_RUN_CONTEXT,
+                    "thread_id": thread["thread_id"],
+                    "channel_name": "feishu",
+                },
+            )
+            contract = _extract_feishu_skill_contract(result)
+            if not isinstance(contract, dict):
+                contract = extract_feishu_skill_contract_candidate(result if isinstance(result, Mapping) else None)
+            if not isinstance(contract, dict):
+                latest_errors = ["presentation builder did not return feishu_skill_contract"]
+                retry_feedback = build_feishu_presentation_retry_feedback(schema_result=None, quality_result=None)
+                retry_feedback.schema_errors = list(latest_errors)
+                continue
+
+            schema_result = validate_and_normalize_contract(contract, channel_name="feishu")
+            quality_result = validate_contract_quality(contract)
+            if schema_result.ok and quality_result.ok and isinstance(schema_result.normalized, dict):
+                return schema_result.normalized, []
+
+            retry_feedback = build_feishu_presentation_retry_feedback(
+                schema_result=schema_result,
+                quality_result=quality_result,
+            )
+            latest_errors = [*retry_feedback.schema_errors, *retry_feedback.quality_errors]
+
+        return None, latest_errors
+
     # -- lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
@@ -1341,26 +1439,42 @@ class ChannelManager:
         artifacts = _extract_artifacts(result)
         outbound_metadata: dict[str, Any] = _slim_metadata(msg.metadata)
         feishu_chart_contract_missing = False
+        response_text, attachments = _prepare_artifact_delivery(thread_id, response_text, artifacts)
         if msg.channel_name == "feishu":
             chart_requested = _looks_like_chart_request(msg.text)
             outbound_metadata["feishu_chart_requested"] = chart_requested
             contract = _extract_feishu_skill_contract(result)
             if isinstance(contract, dict):
-                outbound_metadata["feishu_skill_contract"] = contract
-            else:
+                schema_result = validate_and_normalize_contract(contract, channel_name="feishu")
+                quality_result = validate_contract_quality(contract)
+                if schema_result.ok and quality_result.ok and isinstance(schema_result.normalized, dict):
+                    outbound_metadata["feishu_skill_contract"] = schema_result.normalized
+                else:
+                    contract = None
+            if not isinstance(contract, dict):
                 payload = _extract_feishu_card_payload(result)
                 if isinstance(payload, dict):
                     outbound_metadata["feishu_card_payload"] = payload
-                elif chart_requested:
-                    outbound_metadata["feishu_contract_missing_for_chart"] = True
-                    feishu_chart_contract_missing = True
-            if (
-                chart_requested
-                and "feishu_skill_contract" not in outbound_metadata
-                and "feishu_card_payload" not in outbound_metadata
-            ):
-                outbound_metadata["feishu_contract_missing_for_chart"] = True
-                feishu_chart_contract_missing = True
+                else:
+                    generated_contract, presentation_errors = await self._generate_feishu_presentation_contract(
+                        client,
+                        analysis_text=response_text,
+                        artifacts=artifacts,
+                        attachments=attachments,
+                    )
+                    if isinstance(generated_contract, dict):
+                        outbound_metadata["feishu_skill_contract"] = generated_contract
+                    else:
+                        feishu_chart_contract_missing = True
+                        outbound_metadata["feishu_contract_missing_for_chart"] = True
+                        response_text = _build_feishu_presentation_failure_text(
+                            response_text,
+                            presentation_errors or ["?????????"],
+                        )
+                        attachments = []
+                        artifacts = []
+            elif "feishu_skill_contract" not in outbound_metadata:
+                outbound_metadata["feishu_skill_contract"] = contract
             logger.info(
                 "[Manager][Feishu] non-stream extraction decided: source=%s chart_requested=%s response_len=%d",
                 _feishu_payload_source_label(
@@ -1379,10 +1493,7 @@ class ChannelManager:
             len(artifacts),
         )
 
-        response_text, attachments = _prepare_artifact_delivery(thread_id, response_text, artifacts)
-
         if msg.channel_name == "feishu" and feishu_chart_contract_missing:
-            response_text = _FEISHU_CHART_CONTRACT_REQUIRED_TEXT
             attachments = []
             artifacts = []
 
@@ -1530,6 +1641,8 @@ class ChannelManager:
                     contract = _extract_feishu_skill_contract_from_stream_payload(payload)
                     if isinstance(contract, dict):
                         latest_feishu_contract = contract
+                        if msg.channel_name == "feishu":
+                            latest_text = "已生成图表卡片数据，正在渲染最终结果..."
                         logger.info(
                             "[Manager][Feishu] stream chunk extracted feishu_skill_contract: event=%s msg_id=%s",
                             event,
@@ -1539,13 +1652,18 @@ class ChannelManager:
                         payload_metadata = _extract_feishu_card_payload_from_stream_payload(payload)
                         if isinstance(payload_metadata, dict):
                             latest_feishu_card_payload = payload_metadata
+                            if msg.channel_name == "feishu":
+                                latest_text = "已生成图表卡片数据，正在渲染最终结果..."
                             logger.info(
                                 "[Manager][Feishu] stream chunk extracted feishu_card_payload: event=%s msg_id=%s",
                                 event,
                                 current_message_id,
                             )
                     if accumulated_text:
-                        latest_text = accumulated_text
+                        if msg.channel_name == "feishu" and _is_structured_feishu_contract_text(accumulated_text):
+                            latest_text = "已生成图表卡片数据，正在渲染最终结果..."
+                        else:
+                            latest_text = accumulated_text
                         if current_stage not in {"整理答案", "发送结果"}:
                             await publish_progress("整理答案", "已接收模型输出片段", force=True, kind="thought")
                     tool_events = _extract_tool_progress_from_payload(payload)
@@ -1558,15 +1676,22 @@ class ChannelManager:
                     last_values = data
                     snapshot_text = _extract_response_text(data)
                     if snapshot_text:
-                        latest_text = snapshot_text
+                        if msg.channel_name == "feishu" and _is_structured_feishu_contract_text(snapshot_text):
+                            latest_text = "已生成图表卡片数据，正在渲染最终结果..."
+                        else:
+                            latest_text = snapshot_text
                     contract = _extract_feishu_skill_contract(data)
                     if isinstance(contract, dict):
                         latest_feishu_contract = contract
+                        if msg.channel_name == "feishu":
+                            latest_text = "已生成图表卡片数据，正在渲染最终结果..."
                         logger.info("[Manager][Feishu] values snapshot extracted feishu_skill_contract")
                     else:
                         payload_metadata = _extract_feishu_card_payload(data)
                         if isinstance(payload_metadata, dict):
                             latest_feishu_card_payload = payload_metadata
+                            if msg.channel_name == "feishu":
+                                latest_text = "已生成图表卡片数据，正在渲染最终结果..."
                             logger.info("[Manager][Feishu] values snapshot extracted feishu_card_payload")
 
                 if not latest_text or latest_text == last_published_text:
@@ -1708,24 +1833,43 @@ class ChannelManager:
                 feishu_chart_contract_missing = False
                 if not isinstance(latest_feishu_contract, dict):
                     latest_feishu_contract = _extract_feishu_skill_contract(result)
-                if not isinstance(latest_feishu_card_payload, dict):
-                    latest_feishu_card_payload = _extract_feishu_card_payload(result)
                 if isinstance(latest_feishu_contract, dict):
-                    final_metadata["feishu_skill_contract"] = latest_feishu_contract
-                elif isinstance(latest_feishu_card_payload, dict):
-                    final_metadata["feishu_card_payload"] = latest_feishu_card_payload
-                elif chart_requested:
+                    schema_result = validate_and_normalize_contract(latest_feishu_contract, channel_name="feishu")
+                    quality_result = validate_contract_quality(latest_feishu_contract)
+                    if schema_result.ok and quality_result.ok and isinstance(schema_result.normalized, dict):
+                        final_metadata["feishu_skill_contract"] = schema_result.normalized
+                    else:
+                        latest_feishu_contract = None
+                if not isinstance(latest_feishu_contract, dict):
+                    if not isinstance(latest_feishu_card_payload, dict):
+                        latest_feishu_card_payload = _extract_feishu_card_payload(result)
+                    if isinstance(latest_feishu_card_payload, dict):
+                        final_metadata["feishu_card_payload"] = latest_feishu_card_payload
+                    else:
+                        generated_contract, presentation_errors = await self._generate_feishu_presentation_contract(
+                            client,
+                            analysis_text=response_text,
+                            artifacts=artifacts,
+                            attachments=attachments,
+                        )
+                        if isinstance(generated_contract, dict):
+                            final_metadata["feishu_skill_contract"] = generated_contract
+                        else:
+                            response_text = _build_feishu_presentation_failure_text(
+                                response_text,
+                                presentation_errors or ["?????????"],
+                            )
+                            feishu_chart_contract_missing = True
+                if feishu_chart_contract_missing and chart_requested:
                     final_metadata["feishu_contract_missing_for_chart"] = True
-                    feishu_chart_contract_missing = True
                 if feishu_chart_contract_missing:
-                    response_text = _FEISHU_CHART_CONTRACT_REQUIRED_TEXT
                     attachments = []
                     artifacts = []
                 logger.info(
                     "[Manager][Feishu] final metadata decided: source=%s chart_requested=%s text_len=%d",
                     _feishu_payload_source_label(
                         has_contract="feishu_skill_contract" in final_metadata,
-                        has_card_payload="feishu_card_payload" in final_metadata,
+                        has_card_payload=False,
                         chart_requested=bool(chart_requested),
                     ),
                     chart_requested,

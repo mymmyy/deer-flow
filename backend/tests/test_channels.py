@@ -697,6 +697,41 @@ class TestChannelManager:
                 ]
             }
             mock_client = _make_mock_langgraph_client(run_result=run_result)
+            presentation_result = {
+                "messages": [
+                    {"type": "human", "content": "presentation"},
+                    {
+                        "type": "ai",
+                        "content": "ok",
+                        "metadata": {
+                            "feishu_skill_contract": {
+                                "card_schema_version": "v1",
+                                "target_channel": "feishu",
+                                "render_mode": "card",
+                                "fallback_text": "fallback",
+                                "card_payload": {
+                                    "title": "问道手游近7天花费分析",
+                                    "summary": "整体呈上升趋势。",
+                                    "blocks": [
+                                        {"type": "markdown", "markdown": "### 结论\n整体上升。"},
+                                        {
+                                            "type": "chart",
+                                            "chart": {
+                                                "chart_type": "line",
+                                                "title": "趋势",
+                                                "why_this_chart": "展示趋势",
+                                                "dimension": {"name": "日期", "values": ["04-21", "04-22"]},
+                                                "metrics": [{"name": "花费", "values": [100, 120]}],
+                                            },
+                                        },
+                                    ],
+                                },
+                            }
+                        },
+                    },
+                ]
+            }
+            mock_client.runs.wait = AsyncMock(side_effect=[run_result, presentation_result])
             manager._client = mock_client
 
             monkeypatch.setitem(CHANNEL_CAPABILITIES["feishu"], "supports_streaming", False)
@@ -714,11 +749,9 @@ class TestChannelManager:
             final_msg = outbound_received[-1]
             assert isinstance(final_msg.metadata, dict)
             assert final_msg.metadata.get("feishu_chart_requested") is True
-            assert final_msg.metadata.get("feishu_contract_missing_for_chart") is True
-            assert "feishu_skill_contract" not in final_msg.metadata
-            assert "飞书渠道仅支持通过卡片图表返回可视化结果" in final_msg.text
-            assert final_msg.artifacts == []
-            assert final_msg.attachments == []
+            contract = final_msg.metadata.get("feishu_skill_contract")
+            assert isinstance(contract, dict)
+            assert final_msg.metadata.get("feishu_contract_missing_for_chart") is not True
 
         _run(go())
 
@@ -779,6 +812,79 @@ class TestChannelManager:
             assert isinstance(payload, dict)
             assert payload.get("chart_spec", {}).get("type") == "line"
             assert final_msg.metadata.get("feishu_contract_missing_for_chart") is not True
+
+        _run(go())
+
+    def test_handle_chat_feishu_falls_back_to_text_when_presentation_generation_fails(self, monkeypatch):
+        from app.channels.manager import CHANNEL_CAPABILITIES, ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            run_result = {
+                "messages": [
+                    {"type": "human", "content": "分析近14天花费"},
+                    {"type": "ai", "content": "近14天花费整体上升。"},
+                ]
+            }
+            invalid_presentation_result = {
+                "messages": [
+                    {"type": "human", "content": "presentation"},
+                    {
+                        "type": "ai",
+                        "content": "bad",
+                        "metadata": {
+                            "feishu_skill_contract": {
+                                "card_schema_version": "v1",
+                                "target_channel": "feishu",
+                                "render_mode": "card",
+                                "fallback_text": "fallback",
+                                "card_payload": {
+                                    "title": "",
+                                    "summary": "",
+                                    "blocks": [
+                                        {
+                                            "type": "chart",
+                                            "chart": {
+                                                "chart_type": "line",
+                                                "dimension": {"name": "日期", "values": ["04-21"]},
+                                                "metrics": [{"name": "花费", "values": [100]}],
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        },
+                    },
+                ]
+            }
+            mock_client = _make_mock_langgraph_client(run_result=run_result)
+            mock_client.runs.wait = AsyncMock(
+                side_effect=[run_result, invalid_presentation_result, invalid_presentation_result, invalid_presentation_result]
+            )
+            manager._client = mock_client
+
+            monkeypatch.setitem(CHANNEL_CAPABILITIES["feishu"], "supports_streaming", False)
+            await manager.start()
+            inbound = InboundMessage(channel_name="feishu", chat_id="chat1", user_id="user1", text="分析近14天花费")
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            final_msg = outbound_received[-1]
+            assert "可视化展示生成失败" in final_msg.text
+            assert "已改为发送文字版结果" in final_msg.text
+            assert "feishu_skill_contract" not in final_msg.metadata
+            assert mock_client.runs.wait.await_count == 4
 
         _run(go())
 
@@ -1204,6 +1310,79 @@ class TestChannelManager:
 
         _run(go())
 
+    def test_handle_feishu_stream_hides_raw_contract_json_in_non_final_updates(self, monkeypatch):
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            contract_json = json.dumps(
+                {
+                    "metadata": {
+                        "feishu_skill_contract": {
+                            "card_schema_version": "v1",
+                            "target_channel": "feishu",
+                            "render_mode": "card",
+                            "fallback_text": "fallback",
+                        }
+                    }
+                },
+                ensure_ascii=False,
+            )
+            stream_events = [
+                _make_stream_part(
+                    "messages-tuple",
+                    [
+                        {"id": "ai-1", "content": contract_json, "type": "AIMessageChunk"},
+                        {"langgraph_node": "agent"},
+                    ],
+                ),
+                _make_stream_part(
+                    "values",
+                    {
+                        "messages": [
+                            {"type": "human", "content": "hi"},
+                            {"type": "ai", "content": contract_json},
+                        ],
+                        "artifacts": [],
+                    },
+                ),
+            ]
+
+            mock_client = _make_mock_langgraph_client()
+            mock_client.runs.stream = MagicMock(return_value=_make_async_iterator(stream_events))
+            manager._client = mock_client
+
+            await manager.start()
+
+            inbound = InboundMessage(
+                channel_name="feishu",
+                chat_id="chat1",
+                user_id="user1",
+                text="hi",
+                thread_ts="om-source-1",
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: any(m.is_final for m in outbound_received))
+            await manager.stop()
+
+            non_final_messages = [m for m in outbound_received if not m.is_final]
+            assert any(m.text == "已生成图表卡片数据，正在渲染最终结果..." for m in non_final_messages)
+            assert all("feishu_skill_contract" not in (m.text or "") for m in non_final_messages)
+
+        _run(go())
+
     def test_handle_feishu_stream_does_not_publish_sending_result_progress_card(self, monkeypatch):
         from app.channels.manager import ChannelManager
 
@@ -1404,6 +1583,87 @@ class TestChannelManager:
 
         _run(go())
 
+    def test_handle_feishu_stream_generates_contract_when_absent(self, monkeypatch):
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            stream_events = [
+                _make_stream_part(
+                    "values",
+                    {
+                        "messages": [
+                            {"type": "human", "content": "分析近14天花费"},
+                            {"type": "ai", "content": "近14天花费整体上升。"},
+                        ]
+                    },
+                ),
+            ]
+            presentation_result = {
+                "messages": [
+                    {"type": "human", "content": "presentation"},
+                    {
+                        "type": "ai",
+                        "content": "ok",
+                        "metadata": {
+                            "feishu_skill_contract": {
+                                "card_schema_version": "v1",
+                                "target_channel": "feishu",
+                                "render_mode": "card",
+                                "fallback_text": "fallback",
+                                "card_payload": {
+                                    "title": "近14天花费分析",
+                                    "summary": "整体呈上升趋势。",
+                                    "blocks": [
+                                        {"type": "markdown", "markdown": "### 结论\n整体上升。"},
+                                        {
+                                            "type": "chart",
+                                            "chart": {
+                                                "chart_type": "line",
+                                                "title": "趋势",
+                                                "why_this_chart": "展示趋势",
+                                                "dimension": {"name": "日期", "values": ["04-21", "04-22"]},
+                                                "metrics": [{"name": "花费", "values": [100, 120]}],
+                                            },
+                                        },
+                                    ],
+                                },
+                            }
+                        },
+                    },
+                ]
+            }
+
+            mock_client = _make_mock_langgraph_client()
+            mock_client.runs.stream = MagicMock(return_value=_make_async_iterator(stream_events))
+            mock_client.runs.wait = AsyncMock(return_value=presentation_result)
+            manager._client = mock_client
+
+            await manager.start()
+            inbound = InboundMessage(channel_name="feishu", chat_id="chat1", user_id="user1", text="分析近14天花费")
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: any(item.is_final for item in outbound_received))
+            await manager.stop()
+
+            final_msg = [item for item in outbound_received if item.is_final][-1]
+            contract = final_msg.metadata.get("feishu_skill_contract")
+            assert isinstance(contract, dict)
+            assert contract.get("target_channel") == "feishu"
+
+        _run(go())
+
     def test_handle_feishu_stream_error_still_sends_final(self, monkeypatch):
         """When the stream raises mid-way, a final outbound with is_final=True must still be published."""
         from app.channels.manager import ChannelManager
@@ -1453,6 +1713,94 @@ class TestChannelManager:
             final_msgs = [m for m in outbound_received if m.is_final]
             assert len(final_msgs) == 1
             assert final_msgs[0].thread_ts == "om-source-1"
+
+        _run(go())
+
+    def test_handle_feishu_stream_error_falls_back_to_text_when_presentation_generation_fails(self, monkeypatch):
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            async def _failing_stream():
+                yield _make_stream_part(
+                    "values",
+                    {
+                        "messages": [
+                            {"type": "human", "content": "分析近14天花费"},
+                            {"type": "ai", "content": "近14天花费整体上升。"},
+                        ]
+                    },
+                )
+                raise ConnectionError("stream broken")
+
+            invalid_presentation_result = {
+                "messages": [
+                    {"type": "human", "content": "presentation"},
+                    {
+                        "type": "ai",
+                        "content": "bad",
+                        "metadata": {
+                            "feishu_skill_contract": {
+                                "card_schema_version": "v1",
+                                "target_channel": "feishu",
+                                "render_mode": "card",
+                                "fallback_text": "fallback",
+                                "card_payload": {
+                                    "title": "",
+                                    "summary": "",
+                                    "blocks": [
+                                        {
+                                            "type": "chart",
+                                            "chart": {
+                                                "chart_type": "line",
+                                                "dimension": {"name": "日期", "values": ["04-21"]},
+                                                "metrics": [{"name": "花费", "values": [100]}],
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        },
+                    },
+                ]
+            }
+
+            mock_client = _make_mock_langgraph_client()
+            mock_client.runs.stream = MagicMock(return_value=_failing_stream())
+            mock_client.runs.wait = AsyncMock(
+                side_effect=[invalid_presentation_result, invalid_presentation_result, invalid_presentation_result]
+            )
+            manager._client = mock_client
+
+            await manager.start()
+
+            inbound = InboundMessage(
+                channel_name="feishu",
+                chat_id="chat1",
+                user_id="user1",
+                text="分析近14天花费",
+                thread_ts="om-source-1",
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: any(m.is_final for m in outbound_received))
+            await manager.stop()
+
+            final_msg = [m for m in outbound_received if m.is_final][-1]
+            assert "可视化展示生成失败" in final_msg.text
+            assert "已改为发送文字版结果" in final_msg.text
+            assert mock_client.runs.wait.await_count == 3
 
         _run(go())
 

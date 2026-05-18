@@ -5,6 +5,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.channels.commands import KNOWN_CHANNEL_COMMANDS
+from app.channels.feishu_contract import validate_and_normalize_contract, validate_contract_quality
+from app.channels.feishu_presentation_builder import (
+    build_feishu_presentation_prompt,
+    build_feishu_presentation_retry_feedback,
+)
 from app.channels.feishu import FeishuChannel
 from app.channels.message_bus import InboundMessage, MessageBus
 
@@ -843,3 +848,244 @@ def test_feishu_resolves_embedded_metadata_contract_json_text_to_chart_card():
     assert chart_elements
     assert chart_elements[0]["chart_spec"]["type"] == "line"
     assert isinstance(chart_elements[0]["chart_spec"].get("data"), dict)
+
+
+def test_feishu_resolves_skill_contract_image_block():
+    bus = MessageBus()
+    channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
+    outbound = MagicMock()
+    outbound.channel_name = "feishu"
+    outbound.metadata = {
+        "feishu_skill_contract": {
+            "card_schema_version": "v1",
+            "target_channel": "feishu",
+            "render_mode": "card",
+            "fallback_text": "fallback",
+            "card_payload": {
+                "title": "report",
+                "summary": "summary",
+                "blocks": [
+                    {"type": "markdown", "markdown": "### 结论\n见下图。"},
+                    {"type": "image", "image": {"image_key": "img_test", "caption": "趋势附图"}},
+                ],
+            },
+        }
+    }
+    outbound.text = "fallback"
+
+    card = channel._resolve_card(outbound)
+    img_elements = [el for el in card["elements"] if el.get("tag") == "img"]
+    markdown_elements = [el for el in card["elements"] if el.get("tag") == "markdown"]
+    assert img_elements
+    assert img_elements[0]["img_key"] == "img_test"
+    assert any(el.get("content") == "趋势附图" for el in markdown_elements)
+
+
+def test_feishu_contract_accepts_image_block_and_chart_quality_fields():
+    result = validate_and_normalize_contract(
+        {
+            "card_schema_version": "v1",
+            "target_channel": "feishu",
+            "render_mode": "card",
+            "fallback_text": "fallback",
+            "card_payload": {
+                "title": "report",
+                "summary": "summary",
+                "blocks": [
+                    {"type": "markdown", "markdown": "### 结论\n整体上升。"},
+                    {
+                        "type": "chart",
+                        "chart": {
+                            "chart_type": "line",
+                            "title": "趋势",
+                            "why_this_chart": "展示趋势",
+                            "dimension": {"name": "date", "values": ["04-21", "04-22"]},
+                            "metrics": [{"name": "spend", "values": [100, 120]}],
+                        },
+                    },
+                    {
+                        "type": "image",
+                        "image": {
+                            "image_key": "img_xxx",
+                            "caption": "附图说明",
+                        },
+                    },
+                ],
+            },
+        },
+        channel_name="feishu",
+    )
+
+    assert result.ok is True
+    assert result.normalized is not None
+    assert result.normalized["card_payload"]["blocks"][1]["chart"]["why_this_chart"] == "展示趋势"
+    assert result.normalized["card_payload"]["blocks"][2]["image"]["image_key"] == "img_xxx"
+
+
+def test_feishu_contract_quality_rejects_chart_only_card():
+    result = validate_contract_quality(
+        {
+            "card_schema_version": "v1",
+            "target_channel": "feishu",
+            "render_mode": "card",
+            "fallback_text": "fallback",
+            "card_payload": {
+                "title": "report",
+                "summary": "summary",
+                "blocks": [
+                    {
+                        "type": "chart",
+                        "chart": {
+                            "chart_type": "line",
+                            "title": "趋势",
+                            "why_this_chart": "展示趋势",
+                            "dimension": {"name": "date", "values": ["04-21", "04-22"]},
+                            "metrics": [{"name": "spend", "values": [100, 120]}],
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    assert result.ok is False
+    assert "card must contain at least 2 blocks" in result.errors
+    assert "card must contain at least 1 markdown conclusion block" in result.errors
+
+
+def test_feishu_contract_quality_rejects_chart_and_table_together():
+    result = validate_contract_quality(
+        {
+            "card_schema_version": "v1",
+            "target_channel": "feishu",
+            "render_mode": "card",
+            "fallback_text": "fallback",
+            "card_payload": {
+                "title": "report",
+                "summary": "summary",
+                "blocks": [
+                    {"type": "markdown", "markdown": "结论"},
+                    {
+                        "type": "chart",
+                        "chart": {
+                            "chart_type": "line",
+                            "title": "趋势",
+                            "why_this_chart": "展示趋势",
+                            "dimension": {"name": "date", "values": ["04-21", "04-22"]},
+                            "metrics": [{"name": "spend", "values": [100, 120]}],
+                        },
+                    },
+                    {
+                        "type": "table",
+                        "table": {
+                            "title": "明细",
+                            "columns": ["date", "spend"],
+                            "rows": [["04-21", "100"], ["04-22", "120"]],
+                        },
+                    },
+                ],
+            },
+        }
+    )
+
+    assert result.ok is False
+    assert "card must not contain both chart and table blocks" in result.errors
+
+
+def test_feishu_contract_requires_chart_title_and_why_this_chart():
+    result = validate_and_normalize_contract(
+        {
+            "card_schema_version": "v1",
+            "target_channel": "feishu",
+            "render_mode": "card",
+            "fallback_text": "fallback",
+            "card_payload": {
+                "title": "report",
+                "summary": "summary",
+                "blocks": [
+                    {"type": "markdown", "markdown": "结论"},
+                    {
+                        "type": "chart",
+                        "chart": {
+                            "chart_type": "line",
+                            "dimension": {"name": "date", "values": ["04-21", "04-22"]},
+                            "metrics": [{"name": "spend", "values": [100, 120]}],
+                        },
+                    },
+                ],
+            },
+        },
+        channel_name="feishu",
+    )
+
+    assert result.ok is False
+    assert "blocks[1].chart.title must be a non-empty string" in result.errors
+
+
+def test_feishu_presentation_retry_feedback_contains_schema_and_quality_errors():
+    schema_result = validate_and_normalize_contract(
+        {
+            "card_schema_version": "v1",
+            "target_channel": "feishu",
+            "render_mode": "card",
+            "fallback_text": "fallback",
+            "card_payload": {
+                "title": "",
+                "summary": "",
+                "blocks": [
+                    {
+                        "type": "chart",
+                        "chart": {
+                            "chart_type": "line",
+                            "dimension": {"name": "date", "values": ["04-21"]},
+                            "metrics": [{"name": "spend", "values": [100]}],
+                        },
+                    }
+                ],
+            },
+        },
+        channel_name="feishu",
+    )
+    quality_result = validate_contract_quality(
+        {
+            "card_schema_version": "v1",
+            "target_channel": "feishu",
+            "render_mode": "card",
+            "fallback_text": "fallback",
+            "card_payload": {
+                "title": "",
+                "summary": "",
+                "blocks": [
+                    {
+                        "type": "chart",
+                        "chart": {
+                            "chart_type": "line",
+                            "title": "trend",
+                            "why_this_chart": "show trend",
+                            "dimension": {"name": "date", "values": ["04-21"]},
+                            "metrics": [{"name": "spend", "values": [100]}],
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    feedback = build_feishu_presentation_retry_feedback(
+        schema_result=schema_result,
+        quality_result=quality_result,
+    )
+
+    assert any("card_payload.title" in item for item in feedback.schema_errors)
+    assert "missing card title" in feedback.quality_errors
+
+
+def test_feishu_presentation_prompt_requires_chart_table_mutual_exclusion():
+    prompt = build_feishu_presentation_prompt(
+        analysis_text="近14天花费呈上升趋势",
+        artifacts=[],
+        attachments=[],
+        retry_feedback=None,
+    )
+    assert "Do not include both chart and table blocks in the same card." in prompt
+    assert "prefer chart and omit table" in prompt

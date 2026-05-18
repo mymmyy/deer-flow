@@ -653,6 +653,18 @@ class FeishuChannel(Channel):
 
                     if isinstance(chart_spec, dict):
                         elements.append({"tag": "chart", "chart_spec": chart_spec})
+                    continue
+
+                if block_type == "image":
+                    image = block.get("image")
+                    if not isinstance(image, dict):
+                        continue
+                    caption = image.get("caption")
+                    if isinstance(caption, str) and caption.strip():
+                        elements.append({"tag": "markdown", "content": caption.strip()})
+                    image_key = image.get("image_key")
+                    if isinstance(image_key, str) and image_key.strip():
+                        elements.append({"tag": "img", "img_key": image_key.strip()})
 
         if not elements:
             elements.append({"tag": "markdown", "content": " "})

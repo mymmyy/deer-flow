@@ -60,3 +60,14 @@ config.yaml.bak
 /frontend/playwright-report/
 .gstack/
 .worktrees
+docs-feitian/飞书卡片稳定化改造方案.md
+docs-feitian/飞书通道改造开发计划.md
+docs-feitian/飞书通道改造需求文档.md
+docs-feitian/feishu-card-channel-experience.md
+docs-feitian/feishu-card-channel-runbook-1page.md
+docs-feitian/feishu-skill-output-contract-v1.md
+docs-feitian/phase3-rule-note.md
+docs-feitian/phase4-progress-note.md
+docs-feitian/phase5-release-checklist.md
+docs-feitian/phase6-feishu-contract-progress.md
+docs-feitian/secondary-development-ready.md

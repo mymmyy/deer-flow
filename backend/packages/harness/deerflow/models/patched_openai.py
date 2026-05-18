@@ -1,4 +1,4 @@
-"""Patched ChatOpenAI that preserves thought_signature for Gemini thinking models.
+"""Patched ChatOpenAI with OpenAI-compatible gateway compatibility fixes.
 
 When using Gemini with thinking enabled via an OpenAI-compatible gateway (e.g.
 Vertex AI, Google AI Studio, or any proxy), the API requires that the
@@ -14,9 +14,9 @@ signature.  That causes an HTTP 400 ``INVALID_ARGUMENT`` error:
     Unable to submit request because function call `<tool>` in the N. content
     block is missing a `thought_signature`.
 
-This module fixes the problem by overriding ``_get_request_payload`` to
-re-inject tool-call signatures back into the outgoing payload for any assistant
-message that originally carried them.
+This module fixes common gateway issues by overriding ``_get_request_payload``:
+- re-inject dropped assistant tool-call ``thought_signature`` fields;
+- rewrite disallowed ``system`` role messages to ``developer`` on the wire.
 """
 
 from __future__ import annotations
@@ -29,13 +29,17 @@ from langchain_openai import ChatOpenAI
 
 
 class PatchedChatOpenAI(ChatOpenAI):
-    """ChatOpenAI with ``thought_signature`` preservation for Gemini thinking via OpenAI gateway.
+    """ChatOpenAI with compatibility fixes for OpenAI-compatible gateways.
 
     When using Gemini with thinking enabled via an OpenAI-compatible gateway,
     the API expects ``thought_signature`` to be present on tool-call objects in
     multi-turn conversations.  This patched version restores those signatures
     from ``AIMessage.additional_kwargs["tool_calls"]`` into the serialised
     request payload before it is sent to the API.
+
+    Some gateways reject Responses API payloads containing role ``system``
+    with errors like ``System messages are not allowed``. This class rewrites
+    ``system`` to ``developer`` for outgoing payload items.
 
     Usage in ``config.yaml``::
 
@@ -75,6 +79,8 @@ class PatchedChatOpenAI(ChatOpenAI):
         # Obtain the base payload from the parent implementation.
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
 
+        _rewrite_disallowed_system_roles(payload)
+
         payload_messages = payload.get("messages", [])
 
         if len(payload_messages) == len(original_messages):
@@ -89,6 +95,21 @@ class PatchedChatOpenAI(ChatOpenAI):
                 _restore_tool_call_signatures(payload_msg, ai_msg)
 
         return payload
+
+
+def _rewrite_disallowed_system_roles(payload: dict) -> None:
+    """Rewrite ``system`` role to ``developer`` for gateway compatibility."""
+    for msg in payload.get("messages", []) or []:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            msg["role"] = "developer"
+
+    for item in payload.get("input", []) or []:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "message"
+            and item.get("role") == "system"
+        ):
+            item["role"] = "developer"
 
 
 def _restore_tool_call_signatures(payload_msg: dict, orig_msg: AIMessage) -> None:

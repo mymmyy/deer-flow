@@ -47,6 +47,25 @@ def _enable_stream_usage_by_default(model_use_path: str, model_settings_from_con
         model_settings_from_config["stream_usage"] = True
 
 
+def _resolve_model_use_path(model_use_path: str, model_settings_from_config: dict) -> str:
+    """Resolve model class path with compatibility overrides."""
+    if model_use_path != "langchain_openai:ChatOpenAI":
+        return model_use_path
+
+    # Some OpenAI-compatible gateways (especially on Responses API paths)
+    # reject role=system. Use patched provider to rewrite system->developer.
+    if (
+        bool(model_settings_from_config.get("use_responses_api"))
+        and (
+            isinstance(model_settings_from_config.get("base_url"), str)
+            or isinstance(model_settings_from_config.get("openai_api_base"), str)
+        )
+    ):
+        return "deerflow.models.patched_openai:PatchedChatOpenAI"
+
+    return model_use_path
+
+
 def create_chat_model(name: str | None = None, thinking_enabled: bool = False, *, app_config: AppConfig | None = None, **kwargs) -> BaseChatModel:
     """Create a chat model instance from the config.
 
@@ -62,7 +81,8 @@ def create_chat_model(name: str | None = None, thinking_enabled: bool = False, *
     model_config = config.get_model_config(name)
     if model_config is None:
         raise ValueError(f"Model {name} not found in config") from None
-    model_class = resolve_class(model_config.use, BaseChatModel)
+    resolved_model_use_path = _resolve_model_use_path(model_config.use, model_config.model_dump(exclude_none=True))
+    model_class = resolve_class(resolved_model_use_path, BaseChatModel)
     model_settings_from_config = model_config.model_dump(
         exclude_none=True,
         exclude={
@@ -114,7 +134,7 @@ def create_chat_model(name: str | None = None, thinking_enabled: bool = False, *
         kwargs.pop("reasoning_effort", None)
         model_settings_from_config.pop("reasoning_effort", None)
 
-    _enable_stream_usage_by_default(model_config.use, model_settings_from_config)
+    _enable_stream_usage_by_default(resolved_model_use_path, model_settings_from_config)
 
     # For Codex Responses API models: map thinking mode to reasoning_effort
     from deerflow.models.openai_codex_provider import CodexChatModel

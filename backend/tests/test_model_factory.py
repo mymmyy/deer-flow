@@ -995,6 +995,69 @@ def test_openai_responses_api_settings_are_passed_to_chatopenai(monkeypatch):
     assert captured.get("output_version") == "responses/v1"
 
 
+def test_openai_responses_api_with_custom_base_url_uses_patched_openai(monkeypatch):
+    model = ModelConfig(
+        name="gpt-5-proxy",
+        display_name="GPT-5 Proxy",
+        description=None,
+        use="langchain_openai:ChatOpenAI",
+        model="gpt-5.2",
+        api_key="test-key",
+        base_url="https://proxy.example.com/v1",
+        use_responses_api=True,
+        supports_thinking=False,
+        supports_vision=True,
+    )
+    cfg = _make_app_config([model])
+    _patch_factory(monkeypatch, cfg)
+
+    resolved_paths: list[str] = []
+
+    class CapturingModel(FakeChatModel):
+        pass
+
+    def _resolve(path, base):
+        resolved_paths.append(path)
+        return CapturingModel
+
+    monkeypatch.setattr(factory_module, "resolve_class", _resolve)
+
+    factory_module.create_chat_model(name="gpt-5-proxy")
+
+    assert resolved_paths[-1] == "deerflow.models.patched_openai:PatchedChatOpenAI"
+
+
+def test_openai_responses_api_without_custom_base_url_keeps_chatopenai(monkeypatch):
+    model = ModelConfig(
+        name="gpt-5-openai",
+        display_name="GPT-5 OpenAI",
+        description=None,
+        use="langchain_openai:ChatOpenAI",
+        model="gpt-5.2",
+        api_key="test-key",
+        use_responses_api=True,
+        supports_thinking=False,
+        supports_vision=True,
+    )
+    cfg = _make_app_config([model])
+    _patch_factory(monkeypatch, cfg)
+
+    resolved_paths: list[str] = []
+
+    class CapturingModel(FakeChatModel):
+        pass
+
+    def _resolve(path, base):
+        resolved_paths.append(path)
+        return CapturingModel
+
+    monkeypatch.setattr(factory_module, "resolve_class", _resolve)
+
+    factory_module.create_chat_model(name="gpt-5-openai")
+
+    assert resolved_paths[-1] == "langchain_openai:ChatOpenAI"
+
+
 # ---------------------------------------------------------------------------
 # Duplicate keyword argument collision (issue #1977)
 # ---------------------------------------------------------------------------
